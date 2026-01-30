@@ -71,7 +71,7 @@ class BaseVLNCETrainer(BaseILTrainer):
         )
         if load_from_ckpt:
             ckpt_path = config.IL.ckpt_to_load
-            ckpt_dict = self.load_checkpoint(ckpt_path, map_location="cpu")
+            ckpt_dict = self.load_checkpoint(ckpt_path, map_location="cpu", weights_only= False)
             self.policy.load_state_dict(ckpt_dict["state_dict"])
             if config.IL.is_requeue:
                 self.optimizer.load_state_dict(ckpt_dict["optim_state"])
@@ -222,6 +222,7 @@ class BaseVLNCETrainer(BaseILTrainer):
         writer: TensorboardWriter,
         checkpoint_index: int = 0,
     ) -> None:
+        from habitat import Env
         """Evaluates a single checkpoint.
 
         Args:
@@ -249,7 +250,6 @@ class BaseVLNCETrainer(BaseILTrainer):
         )
         config.IL.ckpt_to_load = checkpoint_path
         config.use_pbar = not is_slurm_batch_job()
-
         if len(config.VIDEO_OPTION) > 0:
             config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP_VLNCE")
 
@@ -268,6 +268,11 @@ class BaseVLNCETrainer(BaseILTrainer):
             config, get_env_class(config.ENV_NAME)
         )
         observation_space, action_space = self._get_spaces(config, envs=envs)
+        # envs = Env(config=config.TASK_CONFIG)
+    
+        # observation_space = envs.observation_space
+        # action_space = envs.action_space
+
 
         self._initialize_policy(
             config,
@@ -429,18 +434,241 @@ class BaseVLNCETrainer(BaseILTrainer):
         for k, v in aggregated_stats.items():
             logger.info(f"{k}: {v:.6f}")
             writer.add_scalar(f"eval_{split}_{k}", v, checkpoint_num)
+    #NOTE: This is original inference implementation
+    # def inference(self) -> None:
+    #     """Runs inference on a checkpoint and saves a predictions file."""
+    #     import os
+    #     from habitat_extensions.utils import generate_video, observations_to_image
+    #     from habitat.utils.visualizations.utils import append_text_to_image
+    #     checkpoint_path = self.config.INFERENCE.CKPT_PATH
+    #     logger.info(f"checkpoint_path: {checkpoint_path}")
 
+    #     if self.config.INFERENCE.USE_CKPT_CONFIG:
+    #         config = self._setup_eval_config(
+    #             self.load_checkpoint(checkpoint_path, map_location="cpu")[
+    #                 "config"
+    #             ]
+    #         )
+    #     else:
+    #         config = self.config.clone()
+
+    #     config.defrost()
+    #     config.TASK_CONFIG.DATASET.SPLIT = self.config.INFERENCE.SPLIT
+    #     config.TASK_CONFIG.DATASET.ROLES = ["guide"]
+    #     config.TASK_CONFIG.DATASET.LANGUAGES = config.INFERENCE.LANGUAGES
+    #     config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
+    #     config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = (
+    #         -1
+    #     )
+    #     config.IL.ckpt_to_load = config.INFERENCE.CKPT_PATH
+    #     config.TASK_CONFIG.TASK.MEASUREMENTS = []
+    #     config.TASK_CONFIG.TASK.SENSORS = [
+    #         s for s in config.TASK_CONFIG.TASK.SENSORS if "INSTRUCTION" in s
+    #     ]
+    #     config.ENV_NAME = "VLNCEInferenceEnv"
+
+    #     # Add TOP_DOWN_MAP for visualization
+    #     # config.TASK_CONFIG.TASK.MEASUREMENTS = ["TOP_DOWN_MAP_VLNCE"]
+    #     # config.ENV_NAME = "VLNCEInferenceEnv"
+        
+    #     # # Video settings
+    #     config.VIDEO_DIR = os.path.join(config.CHECKPOINT_FOLDER, "inference_videos")
+    #     config.VIDEO_OPTION = ["disk"]
+        
+    #     config.freeze()
+
+    #     envs = construct_envs_auto_reset_false(
+    #         config, get_env_class(config.ENV_NAME)
+    #     )
+
+    #     observation_space, action_space = self._get_spaces(config, envs=envs)
+
+    #     self._initialize_policy(
+    #         config,
+    #         load_from_ckpt=True,
+    #         observation_space=observation_space,
+    #         action_space=action_space,
+    #     )
+    #     self.policy.eval()
+
+    #     observations = envs.reset()
+    #     observations = extract_instruction_tokens(
+    #         observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID
+    #     )
+    #     batch = batch_obs(observations, self.device)
+    #     batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+    #     rnn_states = torch.zeros(
+    #         envs.num_envs,
+    #         self.policy.net.num_recurrent_layers,
+    #         config.MODEL.STATE_ENCODER.hidden_size,
+    #         device=self.device,
+    #     )
+    #     prev_actions = torch.zeros(
+    #         envs.num_envs, 1, device=self.device, dtype=torch.long
+    #     )
+    #     not_done_masks = torch.zeros(
+    #         envs.num_envs, 1, dtype=torch.uint8, device=self.device
+    #     )
+
+    #     episode_predictions = defaultdict(list)
+
+    #     # episode ID --> instruction ID for rxr predictions format
+    #     instruction_ids: Dict[str, int] = {}
+    #     # Create video directory
+    #     os.makedirs(config.VIDEO_DIR, exist_ok=True)
+
+    #     # Store RGB frames and metadata for each environment
+    #     rgb_frames = [[] for _ in range(envs.num_envs)]
+    #     episode_instructions = {}
+    #     episode_data = {}
+
+    #     # populate episode_predictions with the starting state
+    #     current_episodes = envs.current_episodes()
+    #     for i in range(envs.num_envs):
+    #         episode = current_episodes[i]
+    #         episode_instructions[episode.episode_id] = {
+    #             "text": episode.instruction.instruction_text,
+    #             "tokens": episode.instruction.instruction_tokens,
+    #         }
+    #     for i in range(envs.num_envs):
+    #         episode_predictions[current_episodes[i].episode_id].append(
+    #             envs.call_at(i, "get_info", {"observations": {}})
+    #         )
+    #         if config.INFERENCE.FORMAT == "rxr":
+    #             ep_id = current_episodes[i].episode_id
+    #             k = current_episodes[i].instruction.instruction_id
+    #             instruction_ids[ep_id] = int(k)
+
+    #     with tqdm.tqdm(
+    #         total=sum(envs.count_episodes()),
+    #         desc=f"[inference:{self.config.INFERENCE.SPLIT}]",
+    #     ) as pbar:
+    #         while envs.num_envs > 0:
+    #             current_episodes = envs.current_episodes()
+    #             with torch.no_grad():
+    #                 actions, rnn_states = self.policy.act(
+    #                     batch,
+    #                     rnn_states,
+    #                     prev_actions,
+    #                     not_done_masks,
+    #                     deterministic=not config.INFERENCE.SAMPLE,
+    #                 )
+    #                 prev_actions.copy_(actions)
+
+    #             outputs = envs.step([a[0].item() for a in actions])
+    #             observations, _, dones, infos = [
+    #                 list(x) for x in zip(*outputs)
+    #             ]
+
+    #             not_done_masks = torch.tensor(
+    #                 [[0] if done else [1] for done in dones],
+    #                 dtype=torch.uint8,
+    #                 device=self.device,
+    #             )
+
+    #             # reset envs and observations if necessary
+    #             for i in range(envs.num_envs):
+    #                 episode_predictions[current_episodes[i].episode_id].append(
+    #                     infos[i]
+    #                 )
+    #                 if not dones[i]:
+    #                     continue
+
+    #                 observations[i] = envs.reset_at(i)[0]
+    #                 prev_actions[i] = torch.zeros(1, dtype=torch.long)
+    #                 pbar.update()
+
+    #             observations = extract_instruction_tokens(
+    #                 observations,
+    #                 self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
+    #             )
+    #             batch = batch_obs(observations, self.device)
+    #             batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+    #             envs_to_pause = []
+    #             next_episodes = envs.current_episodes()
+    #             for i in range(envs.num_envs):
+    #                 if not dones[i]:
+    #                     continue
+
+    #                 if next_episodes[i].episode_id in episode_predictions:
+    #                     envs_to_pause.append(i)
+    #                 else:
+    #                     episode_predictions[
+    #                         next_episodes[i].episode_id
+    #                     ].append(
+    #                         envs.call_at(i, "get_info", {"observations": {}})
+    #                     )
+    #                     if config.INFERENCE.FORMAT == "rxr":
+    #                         ep_id = next_episodes[i].episode_id
+    #                         k = next_episodes[i].instruction.instruction_id
+    #                         instruction_ids[ep_id] = int(k)
+
+    #             (
+    #                 envs,
+    #                 rnn_states,
+    #                 not_done_masks,
+    #                 prev_actions,
+    #                 batch,
+    #                 _,
+    #             ) = self._pause_envs(
+    #                 envs_to_pause,
+    #                 envs,
+    #                 rnn_states,
+    #                 not_done_masks,
+    #                 prev_actions,
+    #                 batch,
+    #             )
+
+    #     envs.close()
+
+    #     if config.INFERENCE.FORMAT == "r2r":
+    #         with open(config.INFERENCE.PREDICTIONS_FILE, "w") as f:
+    #             json.dump(episode_predictions, f, indent=2)
+
+    #         logger.info(
+    #             f"Predictions saved to: {config.INFERENCE.PREDICTIONS_FILE}"
+    #         )
+    #     else:  # use 'rxr' format for rxr-habitat leaderboard
+    #         predictions_out = []
+
+    #         for k, v in episode_predictions.items():
+
+    #             # save only positions that changed
+    #             path = [v[0]["position"]]
+    #             for p in v[1:]:
+    #                 if path[-1] != p["position"]:
+    #                     path.append(p["position"])
+
+    #             predictions_out.append(
+    #                 {
+    #                     "instruction_id": instruction_ids[k],
+    #                     "path": path,
+    #                 }
+    #             )
+
+    #         predictions_out.sort(key=lambda x: x["instruction_id"])
+    #         with jsonlines.open(
+    #             config.INFERENCE.PREDICTIONS_FILE, mode="w"
+    #         ) as writer:
+    #             writer.write_all(predictions_out)
+
+    #         logger.info(
+    #             f"Predictions saved to: {config.INFERENCE.PREDICTIONS_FILE}"
+    #         )
     def inference(self) -> None:
         """Runs inference on a checkpoint and saves a predictions file."""
-
+        import os
+        from habitat_extensions.utils import generate_video, observations_to_image
+        from habitat.utils.visualizations.utils import append_text_to_image
+        
         checkpoint_path = self.config.INFERENCE.CKPT_PATH
         logger.info(f"checkpoint_path: {checkpoint_path}")
 
         if self.config.INFERENCE.USE_CKPT_CONFIG:
             config = self._setup_eval_config(
-                self.load_checkpoint(checkpoint_path, map_location="cpu")[
-                    "config"
-                ]
+                self.load_checkpoint(checkpoint_path, map_location="cpu")["config"]
             )
         else:
             config = self.config.clone()
@@ -450,15 +678,20 @@ class BaseVLNCETrainer(BaseILTrainer):
         config.TASK_CONFIG.DATASET.ROLES = ["guide"]
         config.TASK_CONFIG.DATASET.LANGUAGES = config.INFERENCE.LANGUAGES
         config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
-        config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = (
-            -1
-        )
+        config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
         config.IL.ckpt_to_load = config.INFERENCE.CKPT_PATH
-        config.TASK_CONFIG.TASK.MEASUREMENTS = []
+        config.TASK_CONFIG.TASK.MEASUREMENTS = []  # KEEP THIS EMPTY
         config.TASK_CONFIG.TASK.SENSORS = [
             s for s in config.TASK_CONFIG.TASK.SENSORS if "INSTRUCTION" in s
         ]
         config.ENV_NAME = "VLNCEInferenceEnv"
+        
+        # DO NOT add TOP_DOWN_MAP_VLNCE - it causes multiprocessing issues
+        # config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP_VLNCE")
+        
+        # DO NOT set VIDEO_OPTION - capture frames directly instead
+        # config.VIDEO_OPTION = ["disk"]
+        
         config.freeze()
 
         envs = construct_envs_auto_reset_false(
@@ -496,19 +729,30 @@ class BaseVLNCETrainer(BaseILTrainer):
         )
 
         episode_predictions = defaultdict(list)
-
-        # episode ID --> instruction ID for rxr predictions format
         instruction_ids: Dict[str, int] = {}
+        
+        # FIX: Create video directory without multiprocessing measurement
+        video_dir = os.path.join(config.CHECKPOINT_FOLDER, "inference_videos")
+        os.makedirs(video_dir, exist_ok=True)
+        
+        # Store RGB frames directly
+        rgb_frames = [[] for _ in range(envs.num_envs)]
+        episode_instructions = {}
 
         # populate episode_predictions with the starting state
         current_episodes = envs.current_episodes()
         for i in range(envs.num_envs):
-            episode_predictions[current_episodes[i].episode_id].append(
+            episode = current_episodes[i]
+            episode_instructions[episode.episode_id] = {
+                "text": episode.instruction.instruction_text,
+                "tokens": episode.instruction.instruction_tokens,
+            }
+            episode_predictions[episode.episode_id].append(
                 envs.call_at(i, "get_info", {"observations": {}})
             )
-            if config.INFERENCE.FORMAT == "rxr":
-                ep_id = current_episodes[i].episode_id
-                k = current_episodes[i].instruction.instruction_id
+            if self.config.INFERENCE.FORMAT == "rxr":
+                ep_id = episode.episode_id
+                k = episode.instruction.instruction_id
                 instruction_ids[ep_id] = int(k)
 
         with tqdm.tqdm(
@@ -523,14 +767,12 @@ class BaseVLNCETrainer(BaseILTrainer):
                         rnn_states,
                         prev_actions,
                         not_done_masks,
-                        deterministic=not config.INFERENCE.SAMPLE,
+                        deterministic=not self.config.INFERENCE.SAMPLE,
                     )
                     prev_actions.copy_(actions)
 
                 outputs = envs.step([a[0].item() for a in actions])
-                observations, _, dones, infos = [
-                    list(x) for x in zip(*outputs)
-                ]
+                observations, _, dones, infos = [list(x) for x in zip(*outputs)]
 
                 not_done_masks = torch.tensor(
                     [[0] if done else [1] for done in dones],
@@ -538,13 +780,39 @@ class BaseVLNCETrainer(BaseILTrainer):
                     device=self.device,
                 )
 
-                # reset envs and observations if necessary
+                # Capture frames and process episodes
                 for i in range(envs.num_envs):
-                    episode_predictions[current_episodes[i].episode_id].append(
-                        infos[i]
-                    )
+                    episode_predictions[current_episodes[i].episode_id].append(infos[i])
+                    
+                    # FIX: Capture RGB frame directly from observations
+                    if "rgb" in observations[i]:
+                        frame = observations[i]["rgb"]
+                        if isinstance(frame, torch.Tensor):
+                            frame = frame.cpu().numpy()
+                        
+                        # Add instruction text to frame
+                        frame = append_text_to_image(
+                            frame, 
+                            current_episodes[i].instruction.instruction_text
+                        )
+                        rgb_frames[i].append(frame)
+                    
                     if not dones[i]:
                         continue
+
+                    ep_id = current_episodes[i].episode_id
+                    
+                    # Save video for completed episode
+                    if len(rgb_frames[i]) > 0:
+                        import imageio
+                        video_path = os.path.join(video_dir, f"{ep_id}.mp4")
+                        try:
+                            imageio.mimsave(video_path, rgb_frames[i], fps=10)
+                            logger.info(f"Saved video: {video_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to save video for {ep_id}: {e}")
+                        
+                        rgb_frames[i] = []
 
                     observations[i] = envs.reset_at(i)[0]
                     prev_actions[i] = torch.zeros(1, dtype=torch.long)
@@ -566,12 +834,10 @@ class BaseVLNCETrainer(BaseILTrainer):
                     if next_episodes[i].episode_id in episode_predictions:
                         envs_to_pause.append(i)
                     else:
-                        episode_predictions[
-                            next_episodes[i].episode_id
-                        ].append(
+                        episode_predictions[next_episodes[i].episode_id].append(
                             envs.call_at(i, "get_info", {"observations": {}})
                         )
-                        if config.INFERENCE.FORMAT == "rxr":
+                        if self.config.INFERENCE.FORMAT == "rxr":
                             ep_id = next_episodes[i].episode_id
                             k = next_episodes[i].instruction.instruction_id
                             instruction_ids[ep_id] = int(k)
@@ -594,37 +860,29 @@ class BaseVLNCETrainer(BaseILTrainer):
 
         envs.close()
 
-        if config.INFERENCE.FORMAT == "r2r":
-            with open(config.INFERENCE.PREDICTIONS_FILE, "w") as f:
+        # Save predictions as before
+        if self.config.INFERENCE.FORMAT == "r2r":
+            with open(self.config.INFERENCE.PREDICTIONS_FILE, "w") as f:
                 json.dump(episode_predictions, f, indent=2)
-
-            logger.info(
-                f"Predictions saved to: {config.INFERENCE.PREDICTIONS_FILE}"
-            )
-        else:  # use 'rxr' format for rxr-habitat leaderboard
+            logger.info(f"Predictions saved to: {self.config.INFERENCE.PREDICTIONS_FILE}")
+        else:
             predictions_out = []
-
             for k, v in episode_predictions.items():
-
-                # save only positions that changed
                 path = [v[0]["position"]]
                 for p in v[1:]:
                     if path[-1] != p["position"]:
                         path.append(p["position"])
-
-                predictions_out.append(
-                    {
-                        "instruction_id": instruction_ids[k],
-                        "path": path,
-                    }
-                )
-
+                predictions_out.append({
+                    "instruction_id": instruction_ids[k],
+                    "path": path,
+                })
             predictions_out.sort(key=lambda x: x["instruction_id"])
-            with jsonlines.open(
-                config.INFERENCE.PREDICTIONS_FILE, mode="w"
-            ) as writer:
+            with jsonlines.open(self.config.INFERENCE.PREDICTIONS_FILE, mode="w") as writer:
                 writer.write_all(predictions_out)
-
-            logger.info(
-                f"Predictions saved to: {config.INFERENCE.PREDICTIONS_FILE}"
-            )
+            logger.info(f"Predictions saved to: {self.config.INFERENCE.PREDICTIONS_FILE}")
+        
+        # Save instructions metadata
+        instructions_file = os.path.join(video_dir, "instructions.json")
+        with open(instructions_file, "w") as f:
+            json.dump(episode_instructions, f, indent=2)
+        logger.info(f"Instructions saved to: {instructions_file}")

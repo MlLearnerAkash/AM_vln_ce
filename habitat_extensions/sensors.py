@@ -174,10 +174,10 @@ class RxRInstructionSensor(Sensor):
 
     def _get_observation_space(self, *args: Any, **kwargs: Any):
         return spaces.Box(
-            low=np.finfo(np.float).min,
-            high=np.finfo(np.float).max,
+            low=np.finfo(np.float64).min,
+            high=np.finfo(np.float64).max,
             shape=(512, 768),
-            dtype=np.float,
+            dtype=np.float64,
         )
 
     def get_observation(

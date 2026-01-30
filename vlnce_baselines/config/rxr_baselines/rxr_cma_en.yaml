@@ -13,7 +13,7 @@ INFERENCE:
   LANGUAGES: [en-US, en-IN]
   SAMPLE: True
   USE_CKPT_CONFIG: False
-  CKPT_PATH: data/checkpoints/ckpt.0.pth  # REPLACE THIS
+  CKPT_PATH: data/checkpoints/rxr_cma_en/ckpt.0.pth  # REPLACE THIS
   PREDICTIONS_FILE: rxr_cma_en_test_challenge.jsonl
   FORMAT: rxr
 
@@ -31,7 +31,7 @@ RL:
 
 IL:
   batch_size: 3
-  epochs: 15
+  epochs: 1
   inflection_weight_coef: 1.9
 
   RECOLLECT_TRAINER:

@@ -87,7 +87,6 @@ def nonlearning_inference(config: Config) -> None:
     for _ in tqdm(range(len(env.episodes)), desc=f"[inference:{split}]"):
         env.reset()
         obs = agent.reset()
-
         episode_id = env.current_episode.episode_id
         episode_predictions[episode_id].append(env.get_info(obs))
 
