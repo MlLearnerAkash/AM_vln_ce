@@ -322,14 +322,15 @@ class BaseVLNCETrainer(BaseILTrainer):
         )
         start_time = time.time()
         #NOTE: Load Gt trajectories
-        gt_trajectories = self._load_gt_trajectories(
-        config.EVAL.SPLIT
-        )
+        gt_trajectories = self._load_gt_trajectories(config.EVAL.SPLIT)
         step_counters = [0 for _ in range(envs.num_envs)]
+        
+        # Track episode IDs to detect new episodes
+        episode_ids_in_env = [None for _ in range(envs.num_envs)]
+        
         while envs.num_envs > 0 and len(stats_episodes) < num_eps:
             current_episodes = envs.current_episodes()
-            current_episode= current_episodes[0]
-            trajectory_id= current_episode.trajectory_id
+            
             with torch.no_grad():
                 policy_actions, rnn_states = self.policy.act(
                     batch,
@@ -339,35 +340,45 @@ class BaseVLNCETrainer(BaseILTrainer):
                     deterministic=not config.EVAL.SAMPLE,
                 )
                 gt_actions = torch.zeros_like(policy_actions)
-        
-                for i in range(envs.num_envs):
-                    ep_id = current_episodes[i].trajectory_id
+            
+            for i in range(envs.num_envs):
+                current_ep_id = current_episodes[i].episode_id
+                current_traj_id = current_episodes[i].trajectory_id
+                
+                # Detect new episode
+                if episode_ids_in_env[i] != current_ep_id:
+                    logger.info(f"Env {i}: New episode {current_ep_id}")
+                    step_counters[i] = 0
+                    episode_ids_in_env[i] = current_ep_id
+                
+                ep_id = current_traj_id
+                
+                if ep_id in gt_trajectories:
+                    gt_actions_list = gt_trajectories[ep_id]
+                    current_step = step_counters[i]
                     
-                    if ep_id in gt_trajectories:
-                        gt_actions_list = gt_trajectories[ep_id]  # List: [1, 1, 2, 1, 0]
-                        current_step = step_counters[i]
+                    if current_step < len(gt_actions_list):
+                        gt_action = gt_actions_list[current_step]
+                        gt_actions[i][0] = gt_action
                         
-                        if current_step < len(gt_actions_list):
-                            # Use GT action for this step
-                            gt_action = gt_actions_list[current_step]
-                            gt_actions[i][0] = gt_action
-                            
-                            logger.info(
-                                f"Env {i}, Step {current_step}: "
-                                f"Policy={policy_actions[i][0].item()}, "
-                                f"GT={gt_action}"
-                            )
-                        else:
-                            # Out of GT actions, use STOP
-                            gt_actions[i][0] = 0
-                            logger.warning(f"Env {i}: Out of GT actions, using STOP")
-                        
-                        step_counters[i] += 1
+                        logger.info(
+                            f"Env {i}, Episode {current_ep_id[:15]}, "
+                            f"Step {current_step}/{len(gt_actions_list)}: "
+                            f"Policy={policy_actions[i][0].item()}, GT={gt_action}"
+                        )
                     else:
-                        # No GT available, fallback to policy
-                        gt_actions[i] = policy_actions[i]
-                        logger.warning(f"Env {i}: No GT for {ep_id}, using policy")
+                        gt_actions[i][0] = 0
+                        logger.error(
+                            f"Env {i}, Episode {current_ep_id}: "
+                            f"Step {current_step} exceeds GT length {len(gt_actions_list)}!"
+                        )
+                    
+                    step_counters[i] += 1
+                else:
+                    gt_actions[i] = policy_actions[i]
+                    logger.warning(f"Env {i}: No GT for {ep_id}")
 
+            # ✅ CRITICAL FIX: Use gt_actions, not policy_actions
             prev_actions.copy_(gt_actions)
 
             outputs = envs.step([a[0].item() for a in gt_actions])
@@ -379,22 +390,34 @@ class BaseVLNCETrainer(BaseILTrainer):
                 device=self.device,
             )
 
-            # reset envs and observations if necessary
-            for i in range(envs.num_envs):                
+            # Reset envs and observations if necessary
+            for i in range(envs.num_envs):
                 if len(config.VIDEO_OPTION) > 0:
                     frame = observations_to_image(observations[i], infos[i])
                     frame = append_text_to_image(
                         frame, current_episodes[i].instruction.instruction_text
                     )
                     rgb_frames[i].append(frame)
+                
                 if not dones[i]:
                     continue
 
                 ep_id = current_episodes[i].episode_id
+                
+                logger.info(f"\n{'='*80}")
+                logger.info(f"Episode Complete: {ep_id}")
+                logger.info(f"Steps taken: {step_counters[i]}")
+                logger.info(f"Success: {infos[i].get('success', False)}")
+                logger.info(f"SPL: {infos[i].get('spl', 0.0):.4f}")
+                logger.info(f"NDTW: {infos[i].get('ndtw', 0.0):.4f}")
+                logger.info(f"{'='*80}\n")
+                
                 stats_episodes[ep_id] = infos[i]
                 observations[i] = envs.reset_at(i)[0]
                 prev_actions[i] = torch.zeros(1, dtype=torch.long)
                 step_counters[i] = 0
+                episode_ids_in_env[i] = None
+                
                 if config.use_pbar:
                     pbar.update()
                 else:
@@ -419,36 +442,45 @@ class BaseVLNCETrainer(BaseILTrainer):
                     del stats_episodes[ep_id]["top_down_map_vlnce"]
                     rgb_frames[i] = []
 
-            observations = extract_instruction_tokens(
-                observations,
-                self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
-            )
-            batch = batch_obs(observations, self.device)
-            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+        observations = extract_instruction_tokens(
+            observations,
+            self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
+        )
+        batch = batch_obs(observations, self.device)
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
-            envs_to_pause = []
-            next_episodes = envs.current_episodes()
+        envs_to_pause = []
+        next_episodes = envs.current_episodes()
 
-            for i in range(envs.num_envs):
-                if next_episodes[i].episode_id in stats_episodes:
-                    envs_to_pause.append(i)
+        for i in range(envs.num_envs):
+            if next_episodes[i].episode_id in stats_episodes:
+                envs_to_pause.append(i)
 
-            (
-                envs,
-                rnn_states,
-                not_done_masks,
-                prev_actions,
-                batch,
-                rgb_frames,
-            ) = self._pause_envs(
-                envs_to_pause,
-                envs,
-                rnn_states,
-                not_done_masks,
-                prev_actions,
-                batch,
-                rgb_frames,
-            )
+        # ✅ FIX: Update step_counters when pausing
+        if len(envs_to_pause) > 0:
+            state_index = list(range(envs.num_envs))
+            for idx in reversed(envs_to_pause):
+                state_index.pop(idx)
+            
+            step_counters = [step_counters[i] for i in state_index]
+            episode_ids_in_env = [episode_ids_in_env[i] for i in state_index]
+
+        (
+            envs,
+            rnn_states,
+            not_done_masks,
+            prev_actions,
+            batch,
+            rgb_frames,
+        ) = self._pause_envs(
+            envs_to_pause,
+            envs,
+            rnn_states,
+            not_done_masks,
+            prev_actions,
+            batch,
+            rgb_frames,
+        )
 
         envs.close()
         if config.use_pbar:
@@ -808,4 +840,3 @@ class BaseVLNCETrainer(BaseILTrainer):
             logger.info(
                 f"Predictions saved to: {config.INFERENCE.PREDICTIONS_FILE}"
             )
-    

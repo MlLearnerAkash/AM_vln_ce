@@ -32,7 +32,7 @@ RL:
 
 IL:
   batch_size: 3
-  epochs: 1
+  epochs: 15
   inflection_weight_coef: 1.9
 
   RECOLLECT_TRAINER:
