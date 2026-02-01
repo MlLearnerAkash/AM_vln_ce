@@ -10,6 +10,7 @@ import jsonlines
 import torch
 import torch.nn.functional as F
 import tqdm
+import cv2
 from gym import Space
 from habitat import Config, logger
 from habitat.utils.visualizations.utils import append_text_to_image
@@ -320,24 +321,56 @@ class BaseVLNCETrainer(BaseILTrainer):
             " [Time elapsed (s): {time}]"
         )
         start_time = time.time()
-
+        #NOTE: Load Gt trajectories
+        gt_trajectories = self._load_gt_trajectories(
+        config.EVAL.SPLIT
+        )
+        step_counters = [0 for _ in range(envs.num_envs)]
         while envs.num_envs > 0 and len(stats_episodes) < num_eps:
             current_episodes = envs.current_episodes()
-            #NOTE: Akash developing
-            episode= current_episodes[0]
-            if hasattr(episode, 'gt_trajectory') and episode.gt_trajectory:
-                print("pass")
+            current_episode= current_episodes[0]
+            trajectory_id= current_episode.trajectory_id
             with torch.no_grad():
-                actions, rnn_states = self.policy.act(
+                policy_actions, rnn_states = self.policy.act(
                     batch,
                     rnn_states,
                     prev_actions,
                     not_done_masks,
                     deterministic=not config.EVAL.SAMPLE,
                 )
-                prev_actions.copy_(actions)
+                gt_actions = torch.zeros_like(policy_actions)
+        
+                for i in range(envs.num_envs):
+                    ep_id = current_episodes[i].trajectory_id
+                    
+                    if ep_id in gt_trajectories:
+                        gt_actions_list = gt_trajectories[ep_id]  # List: [1, 1, 2, 1, 0]
+                        current_step = step_counters[i]
+                        
+                        if current_step < len(gt_actions_list):
+                            # Use GT action for this step
+                            gt_action = gt_actions_list[current_step]
+                            gt_actions[i][0] = gt_action
+                            
+                            logger.info(
+                                f"Env {i}, Step {current_step}: "
+                                f"Policy={policy_actions[i][0].item()}, "
+                                f"GT={gt_action}"
+                            )
+                        else:
+                            # Out of GT actions, use STOP
+                            gt_actions[i][0] = 0
+                            logger.warning(f"Env {i}: Out of GT actions, using STOP")
+                        
+                        step_counters[i] += 1
+                    else:
+                        # No GT available, fallback to policy
+                        gt_actions[i] = policy_actions[i]
+                        logger.warning(f"Env {i}: No GT for {ep_id}, using policy")
 
-            outputs = envs.step([a[0].item() for a in actions])
+            prev_actions.copy_(gt_actions)
+
+            outputs = envs.step([a[0].item() for a in gt_actions])
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
 
             not_done_masks = torch.tensor(
@@ -347,14 +380,13 @@ class BaseVLNCETrainer(BaseILTrainer):
             )
 
             # reset envs and observations if necessary
-            for i in range(envs.num_envs):
+            for i in range(envs.num_envs):                
                 if len(config.VIDEO_OPTION) > 0:
                     frame = observations_to_image(observations[i], infos[i])
                     frame = append_text_to_image(
                         frame, current_episodes[i].instruction.instruction_text
                     )
                     rgb_frames[i].append(frame)
-
                 if not dones[i]:
                     continue
 
@@ -362,7 +394,7 @@ class BaseVLNCETrainer(BaseILTrainer):
                 stats_episodes[ep_id] = infos[i]
                 observations[i] = envs.reset_at(i)[0]
                 prev_actions[i] = torch.zeros(1, dtype=torch.long)
-
+                step_counters[i] = 0
                 if config.use_pbar:
                     pbar.update()
                 else:
@@ -439,30 +471,119 @@ class BaseVLNCETrainer(BaseILTrainer):
             logger.info(f"{k}: {v:.6f}")
             writer.add_scalar(f"eval_{split}_{k}", v, checkpoint_num)
     
-    def _get_action_to_target(self, observation, target_position):
+    #NOTE load GT_trajectories
+    def _load_gt_trajectories(self, split: str = "val_unseen") -> Dict:
+        """Load GT trajectories from file.
+        
+        Args:
+            split: data split name (e.g., "val_unseen")
+        
+        Returns:
+            Dict mapping episode_id to trajectory data
         """
-        Determines the best action to take to reach target_position.
-        This is a simplified version - adjust based on your action space.
+        import gzip
+        import json
+        
+        gt_file = os.path.join(
+            self.config.GT_FOLDER,
+            split,
+            f"{split}_guide_gt.json.gz"
+        )
+        
+        if not os.path.exists(gt_file):
+            logger.warning(f"GT trajectories file not found: {gt_file}")
+            return {}
+        
+        logger.info(f"Loading GT trajectories from: {gt_file}")
+        
+        try:
+            with gzip.open(gt_file, 'rt', encoding='utf-8') as f:
+                full_json= json.load(f)
+                return {
+                key: value.get("actions", []) 
+                for key, value in full_json.items()
+            }
+            
+            
+        except Exception as e:
+            logger.error(f"Error loading GT trajectories: {e}")
+            return {}
+        
+        # return gt_trajectories
+    #NOTE: shortest path waypoint_to_action
+    def _waypoints_to_actions(
+        self,
+        waypoints: List[List[float]],
+        current_position: List[float],
+        current_rotation: List[float],
+    ) -> int:
+        """Convert current position and next waypoint to action.
+        
+        Args:
+            waypoints: List of [x, y, z] positions (GT path)
+            current_position: Current agent [x, y, z]
+            current_rotation: Current agent rotation (quaternion)
+        
+        Returns:
+            action: 0=STOP, 1=FORWARD, 2=LEFT, 3=RIGHT
         """
-        # Get current position from observation or state
-        current_position = observation.get("position", [0, 0, 0])
         
-        # Calculate direction to target
-        direction = [
-            target_position[i] - current_position[i] 
-            for i in range(len(current_position))
-        ]
+        import numpy as np
         
-        # Simple heuristic: choose action based on dominant direction
-        # Action space typically: 0=STOP, 1=FORWARD, 2=LEFT, 3=RIGHT
-        # You may need to adjust this based on your specific action space
-        abs_direction = [abs(d) for d in direction]
-        max_idx = abs_direction.index(max(abs_direction))
+        # Get next waypoint
+        if len(waypoints) == 0:
+            return 0  # STOP
         
-        if max_idx == 0:  # x direction
-            return 3 if direction[0] > 0 else 2  # RIGHT or LEFT
-        else:  # z direction  
+        next_waypoint = np.array(waypoints[0])
+        current_pos = np.array(current_position)
+        
+        # Calculate distance to next waypoint
+        distance = np.linalg.norm(next_waypoint[:2] - current_pos[:2])  # Only XZ distance
+        
+        logger.info(f"Distance to next waypoint: {distance:.3f}m")
+        
+        # If reached waypoint (within 0.3m), remove it and go to next
+        if distance < 0.3:
+            waypoints.pop(0)  # Remove reached waypoint
+            if len(waypoints) == 0:
+                return 0  # STOP - reached end
+            next_waypoint = np.array(waypoints[0])
+            distance = np.linalg.norm(next_waypoint[:2] - current_pos[:2])
+        
+        # Get agent's forward direction from rotation (quaternion)
+        # quaternion: [x, y, z, w]
+        qx, qy, qz, qw = current_rotation
+        
+        # Convert quaternion to forward vector
+        forward = np.array([
+            2 * (qw * qy + qx * qz),  # x component
+            2 * (qz * qy - qx * qw),  # z component
+        ])
+        forward = forward / (np.linalg.norm(forward) + 1e-6)
+        
+        # Direction to next waypoint
+        direction_to_waypoint = next_waypoint[:2] - current_pos[:2]
+        direction_to_waypoint = direction_to_waypoint / (np.linalg.norm(direction_to_waypoint) + 1e-6)
+        
+        # Calculate angle between forward and target direction
+        # Using cross product and dot product
+        dot_product = np.dot(forward, direction_to_waypoint)
+        cross_product = forward[0] * direction_to_waypoint[1] - forward[1] * direction_to_waypoint[0]
+        
+        angle = np.arctan2(cross_product, dot_product)  # -π to π
+        angle_degrees = np.degrees(angle)
+        
+        logger.info(f"Angle to waypoint: {angle_degrees:.1f}°")
+        
+        # Decide action based on angle
+        # Agent turns 15 degrees per LEFT or RIGHT action
+        
+        if abs(angle_degrees) < 15:  # Already facing waypoint
             return 1  # FORWARD
+        elif angle_degrees > 0:  # Need to turn left
+            return 2  # LEFT
+        else:  # Need to turn right
+            return 3  # RIGHT
         
     #NOTE: This is original inference implementation
     def inference(self) -> None:
@@ -498,8 +619,8 @@ class BaseVLNCETrainer(BaseILTrainer):
         config.ENV_NAME = "VLNCEInferenceEnv"
 
         # Add TOP_DOWN_MAP for visualization
-        # config.TASK_CONFIG.TASK.MEASUREMENTS = ["TOP_DOWN_MAP_VLNCE"]
-        # config.ENV_NAME = "VLNCEInferenceEnv"
+        config.TASK_CONFIG.TASK.MEASUREMENTS = ["TOP_DOWN_MAP_VLNCE"]
+        config.ENV_NAME = "VLNCEInferenceEnv"
         
         # # Video settings
         config.VIDEO_DIR = os.path.join(config.CHECKPOINT_FOLDER, "inference_videos")
