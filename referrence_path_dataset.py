@@ -30,6 +30,8 @@ def reference_path_example_with_video():
     )
     follower.mode = "geodesic_path"
 
+    pf = env._env.sim.pathfinder
+
     actions = defaultdict(list)
     rgb_frames = []
     stats_episodes = {}
@@ -50,10 +52,22 @@ def reference_path_example_with_video():
             logger.info(f"Instruction: {instruction_text}")
             logger.info(f"{'='*80}\n")
 
-            for point in reference_path:
+            for waypoint_idx, point in enumerate(reference_path):
+                
+                logger.info(f"Moving to waypoint {waypoint_idx + 1}/{len(reference_path)}")
                 while not env._env.episode_over:
+                    # current_distance = env._env.sim.geodesic_distance(
+                    #         env._env.sim.get_agent_state().position, point
+                    #     )
+
+
+                    # logger.info(f"Waypoint {waypoint_idx + 1}: Distance = {current_distance:.4f}m")
+                    if env._env.sim.previous_step_collided:
+                        print(f"Collision detected at: {waypoint_idx + 1}-- agent can't move anymore")
+                        break
                     best_action = follower.get_next_action(point)
-                    if best_action is None:
+                    if best_action == None:
+                        logger.info(f"waypoint {waypoint_idx+1} reached")
                         break
 
                     obs, _, done, info = env.step(best_action)
@@ -67,14 +81,15 @@ def reference_path_example_with_video():
 
                     if done:
                         break
-
+                if env._env.episode_over:
+                    break
+                        
             # Add final STOP action
             # obs, _, done, info = env.step(HabitatSimActions.STOP)
             actions[episode_id].append(HabitatSimActions.STOP)
             frame = observations_to_image(obs, info)
             frame = append_text_to_image(frame, instruction_text)
             rgb_frames.append(frame)
-
             # Store episode stats
             stats_episodes[episode_id] = {
                 "steps": step_count,
