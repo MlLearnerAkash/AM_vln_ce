@@ -62,9 +62,10 @@ def reference_path_example_with_video():
 
 
                     # logger.info(f"Waypoint {waypoint_idx + 1}: Distance = {current_distance:.4f}m")
-                    if env._env.sim.previous_step_collided:
-                        print(f"Collision detected at: {waypoint_idx + 1}-- agent can't move anymore")
-                        break
+                    #NOTE: braking if collison detected
+                    # if env._env.sim.previous_step_collided:
+                    #     print(f"Collision detected at: {waypoint_idx + 1} -- agent can't move anymore")
+                    #     break
                     best_action = follower.get_next_action(point)
                     if best_action == None:
                         logger.info(f"waypoint {waypoint_idx+1} reached")
