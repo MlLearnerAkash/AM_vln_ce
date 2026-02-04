@@ -2,6 +2,7 @@ import os
 from collections import defaultdict
 import torch
 import tqdm
+import numpy as np
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat import logger
 
@@ -10,7 +11,7 @@ from habitat_extensions.utils import generate_video, observations_to_image
 from habitat.utils.visualizations.utils import append_text_to_image
 from vlnce_baselines.common.environments import VLNCEDaggerEnv
 from vlnce_baselines.config.default import get_config
-
+from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances, encode_normalized_distances_to_frame, save_norm_frame_heatmap
 
 def reference_path_example_with_video():
     r"""Generate videos of an agent following the VLN-CE reference path."""
@@ -42,7 +43,7 @@ def reference_path_example_with_video():
             obs = env.reset()
             episode_id = env.current_episode.episode_id
             reference_path = env.current_episode.reference_path
-            instruction_text = env.current_episode.instruction.instruction_text
+            instruction_text = env.current_episode.instruction.instruction_text            
             
             rgb_frames = []
             step_count = 0
@@ -80,6 +81,12 @@ def reference_path_example_with_video():
                     frame = append_text_to_image(frame, instruction_text)
                     rgb_frames.append(frame)
 
+                    #NOTE: To collect geodesic distances from current frame objects to goal position
+                    semantic_frame = obs["semantic"]
+                    distances= get_object_geodesic_distances(env, semantic_frame)
+                    norm_frame= encode_normalized_distances_to_frame(semantic_frame, distances)
+                    #NOTE: For debug purpose only
+                    save_norm_frame_heatmap(norm_frame, "/data/ws/VLN-CE/reference_path_videos/test_heatmap.png")
                     if done:
                         break
                 if env._env.episode_over:
