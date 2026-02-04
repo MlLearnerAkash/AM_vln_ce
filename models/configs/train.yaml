@@ -1,0 +1,27 @@
+train:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 0.0001
+  optimizer: adam
+  seed: 42
+  log_interval: 10
+  save_interval: 1
+
+dataset:
+  name: VLNCE
+  data_dir: /data/ws/VLN-CE/datasets
+  train_split: train
+  val_split: val
+  num_workers: 4
+  input_type: rgb+semantic
+  img_res: 512
+
+device:
+  use_cuda: true
+  device_id: 0
+  device: "cuda"
+
+model:
+  model_name: vlnce_baseline
+  model_path: /data/ws/VLN-CE/chkpt/GPT4Scene-qwen2vl_full_sft_mark_32_3D_img512
+  resume: false

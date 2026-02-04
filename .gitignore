@@ -145,3 +145,5 @@ stats_*.json
 
 # custom slurm utils
 sbatch_scripts
+reference_path_videos
+chkpt
