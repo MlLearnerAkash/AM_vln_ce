@@ -165,5 +165,5 @@ if __name__ == "__main__":
         history_length=history_length,
         output_hidden_states=True
     )
-print(hidden_state)#(1, 157, 3584)
+    print(hidden_state)#(1, 157, 3584)
 
