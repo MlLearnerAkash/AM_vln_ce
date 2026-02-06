@@ -1,6 +1,7 @@
 from qwen_vl_utils import process_vision_info
 from PIL import Image
 import yaml
+import numpy as np
 
 import os
 import json
@@ -8,27 +9,33 @@ import torch
 from tqdm import tqdm
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
-def preprocess_image_nearest(image_path: str, image_resolution: int, perform_resize: bool = False) -> tuple[int, int]:
+def preprocess_image_nearest(image_input: str, image_resolution: int, perform_resize: bool = False) -> tuple[int, int]:
     try:
-        with Image.open(image_path) as image:
-            original_width, original_height = image.width, image.height
-            max_dimension = max(original_width, original_height)
+        if isinstance(image_input, np.ndarray):
+            image = Image.fromarray(image_input)
+        elif isinstance(image_input, str):
+            image = Image.open(image_input)
+        else:
+            raise ValueError("Input must be a numpy array or a file path.")
 
-            if max_dimension > image_resolution:
-                resize_factor = image_resolution / max_dimension
-                new_width = int(original_width * resize_factor)
-                new_height = int(original_height * resize_factor)
-            else:
-                new_width, new_height = original_width, original_height
+        original_width, original_height = image.width, image.height
+        max_dimension = max(original_width, original_height)
 
-            if perform_resize:
-                resized_image = image.resize((new_width, new_height), resample=Image.NEAREST)
-                if image.mode != "RGB":
-                    resized_image = resized_image.convert("RGB")
-                return new_width, new_height, resized_image
+        if max_dimension > image_resolution:
+            resize_factor = image_resolution / max_dimension
+            new_width = int(original_width * resize_factor)
+            new_height = int(original_height * resize_factor)
+        else:
+            new_width, new_height = original_width, original_height
+
+        if perform_resize:
+            resized_image = image.resize((new_width, new_height), resample=Image.NEAREST)
+            if image.mode != "RGB":
+                resized_image = resized_image.convert("RGB")
+            return new_width, new_height, resized_image
 
     except Exception as e:
-        raise IOError(f"Can not open the image {image_path}: {e}")
+        raise IOError(f"Can not open the image {image_input}: {e}")
 
     return new_height, new_width
 
