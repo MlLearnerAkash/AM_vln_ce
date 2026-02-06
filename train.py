@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import logging
+import wandb
 
 import tempfile
 import os
@@ -10,8 +11,11 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
+from pytorch_msssim import ssim
+
 
 from models.model import QwenVLHeatmapModel, count_parameters
+from models.unet_clip import CLIPUNet2D
 from dataset.episode_generator import episode_generator
 from vlnce_baselines.config.default import get_config
 
@@ -43,11 +47,13 @@ def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
 
 
 if __name__ == "__main__":
+    NUM_EPOCHS= 1
     config_path = "/data/ws/VLN-CE/models/configs/train.yaml"
-    model = QwenVLHeatmapModel(config_path)
-    total_params, trainable_params = count_parameters(model.vl_model)
-    print(f"Total parameters in decoder: {total_params}")
-    print(f"Trainable parameters in decoder: {trainable_params}")
+    # model = QwenVLHeatmapModel(config_path)
+    model = CLIPUNet2D(in_channels=3, out_channels=1, fChannel=64).to("cuda" if torch.cuda.is_available() else "cpu")
+    # total_params, trainable_params = count_parameters(model.vl_model)
+    # print(f"Total parameters in decoder: {total_params}")
+    # print(f"Trainable parameters in decoder: {trainable_params}")
 
     logging.basicConfig(
     # filename="train.log",
@@ -68,42 +74,76 @@ if __name__ == "__main__":
 
     os.makedirs(config.VIDEO_DIR, exist_ok=True)
 
-    for episode_data in episode_generator(config, num_episodes=5):
-        episode_id = episode_data["episode_id"]
-        instruction = episode_data["instruction"]
-        frames = episode_data["frames"]
-        norm_frames = episode_data["norm_frames"]
+    wandb.init(
+        project="VLNCE-Heatmap",
+        name="QwenVLHeatmapModel-Training",
+        config={"lr": 1e-3, "optimizer": "Adam"}
+    )
 
-        # instruction = "Go to the kitchen and find a cup on the table."
-        image_sequence = [f"/data/ws/VLN-CE/reference_path_videos/test_heatmap_{i}.png" for i in range(4)]
-        heatmap_sequence = [f"/data/ws/VLN-CE/reference_path_videos/test_heatmap_{i}.png" for i in range(4)]
-        current_timestep = 2
-        history_length = 1
+    optimizer = torch.optim.Adam(model.parameters(), lr=10e-5)
+    for epoch in range(NUM_EPOCHS):
+        for episode_data in episode_generator(config, num_episodes=5):
+            episode_id = episode_data["episode_id"]
+            instruction = episode_data["instruction"]
+            frames = episode_data["frames"]
+            norm_frames = episode_data["norm_frames"]
 
-        if len(frames) != len(norm_frames):
-            print(f"Skipping episode {episode_id}: image and heatmap sequence lengths do not match.")
-            continue
+            if len(frames) != len(norm_frames):
+                print(f"Skipping episode {episode_id}: image and heatmap sequence lengths do not match.")
+                continue
+            
+            with tempfile.TemporaryDirectory(prefix=f"episode_{episode_id}_") as temp_dir:
+                frame_paths, norm_frame_paths = save_numpy_images_to_temp(frames, norm_frames, temp_dir)
+                for current_timestep in range(len(frame_paths)):
+                    frame_np = np.array(Image.open(frame_paths[current_timestep])).astype(np.float32) / 255.0
+                    # Convert to tensor and add batch/channel dimensions if needed
+                    frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+                    frame_tensor = frame_tensor.to("cuda" if torch.cuda.is_available() else "cpu")
 
-        with tempfile.TemporaryDirectory(prefix=f"episode_{episode_id}_") as temp_dir:
-            frame_paths, norm_frame_paths = save_numpy_images_to_temp(frames, norm_frames, temp_dir)
+                    gt_heatmap = np.array(Image.open(norm_frame_paths[current_timestep])).astype(np.float32) / 255.0
+                    #checksum
+                    if np.isclose(gt_heatmap.min(), gt_heatmap.max()):
+                        logger.warning(f"Skipping timestep {current_timestep} in episode {episode_id}: GT heatmap is constant (min == max == {gt_heatmap.min()})")
+                        continue
 
-            for current_timestep in range(len(frame_paths)):
+                    gt_heatmap_tensor = torch.from_numpy(gt_heatmap).unsqueeze(0).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")  # (1, 1, H, W)
 
-                gt_heatmap = np.array(Image.open(norm_frame_paths[current_timestep])).astype(np.float32) / 255.0
-                gt_heatmap_tensor = torch.from_numpy(gt_heatmap).unsqueeze(0).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")  # (1, 1, H, W)
+                    # pred_heatmap = model.forward(
+                    #     instruction=instruction,
+                    #     image_sequence=frame_paths,
+                    #     heatmap_sequence=norm_frame_paths,
+                    #     current_idx=current_timestep,
+                    #     history_length=0
+                    # )
+                    pred_heatmap= model(frame_tensor, [instruction])
+                    
+                    
 
-                pred_heatmap = model.forward(
-                    instruction=instruction,
-                    image_sequence=frame_paths,
-                    heatmap_sequence=norm_frame_paths,
-                    current_idx=current_timestep,
-                    history_length=1
-                )
+                    if pred_heatmap.shape[-2:] != gt_heatmap_tensor.shape[-2:]:
+                        gt_heatmap_tensor = F.interpolate(gt_heatmap_tensor, size=pred_heatmap.shape[-2:], mode='bilinear', align_corners=True)
+
+                    mse_loss = F.mse_loss(pred_heatmap.float(), gt_heatmap_tensor.float())
+                    ssim_value = ssim(pred_heatmap, gt_heatmap_tensor, data_range=1.0, size_average=True)
+                    ssim_loss = 1 - ssim_value  # SSIM is similarity, so 1-SSIM is the loss
+                    total_loss= 0.1*mse_loss+ 0.9*ssim_loss
+                    optimizer.zero_grad()
+                    # mse_loss.backward()
+                    # ssim_loss.backward()
+                    total_loss.backward()
+                    optimizer.step()
+
+                    logger.info(f"Episode {episode_id} | Timestep {current_timestep} | Heatmap shape: {pred_heatmap.shape} | MSE Loss: {total_loss.item():.6f}")
+                    wandb.log({
+                        "episode_id": episode_id,
+                        "timestep": current_timestep,
+                        "total_loss": total_loss.item(),
+                        "mse_loss": mse_loss.item(),
+                        "ssim_loss": ssim_loss.item(),
+                        "gt_heatmap": wandb.Image(gt_heatmap * 255),  # scale for visualization
+                        "pred_heatmap": wandb.Image(pred_heatmap.detach().cpu().squeeze().numpy() * 255)
+                    })
                 
 
-                if pred_heatmap.shape[-2:] != gt_heatmap_tensor.shape[-2:]:
-                    gt_heatmap_tensor = F.interpolate(gt_heatmap_tensor, size=pred_heatmap.shape[-2:], mode='bilinear', align_corners=True)
-
-                mse_loss = F.mse_loss(pred_heatmap.float(), gt_heatmap_tensor.float())
-
-                logger.info(f"Episode {episode_id} | Timestep {current_timestep} | Heatmap shape: {pred_heatmap.shape} | MSE Loss: {mse_loss.item():.6f}")
+    save_path = f"/data/ws/VLN-CE/checkpoints/qwenvl_heatmap_model_ep{episode_id}.pth"
+    torch.save(model.state_dict(), save_path)
+    logger.info(f"Saved full model checkpoint to {save_path}")
