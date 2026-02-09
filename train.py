@@ -8,7 +8,7 @@ import tempfile
 import os
 from PIL import Image
 import numpy as np
-
+import sys
 import torch
 import torch.nn.functional as F
 from pytorch_msssim import ssim
@@ -20,7 +20,10 @@ from models.unet_clip import CLIPUNet2D
 from dataset.episode_generator import episode_generator
 from vlnce_baselines.config.default import get_config
 from dataset.episode_dataset import EpisodeDataset, collate_fn
-from losses.continuous_heatmap_loss import ContinuousHeatmapLoss, SimplifiedContinuousLoss
+from losses.loss import combined_navigation_loss
+
+sys.path.append("/data/ws")
+from obj_rec_to_rank_predictor.src.rank_predictor import RankPredictor
 
 def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
     frames_dir = os.path.join(temp_dir, "frames")
@@ -111,34 +114,15 @@ if __name__ == "__main__":
     os.makedirs(config.VIDEO_DIR, exist_ok=True)
 
     wandb.init(
-        project="VLNCE-Heatmap",
+        project="gradient_loss_VLNCE-Heatmap",
         name="CLIPUNet-ContinuousHeatmap-Training",
         config={
             "lr": 1e-4,
             "optimizer": "AdamW",
-            "loss": "ContinuousHeatmapLoss",
-            "mse_weight": 1.0,
-            "ssim_weight": 0.8,
-            "boundary_weight": 0.5,
-            "smooth_weight": 0.3
         }
     )
 
-    # Initialize the improved loss function
-    # Option 1: Full loss with boundary and smoothness terms (RECOMMENDED)
-    criterion = ContinuousHeatmapLoss(
-        mse_weight=1.0,
-        ssim_weight=0.8,
-        boundary_weight=0.5,
-        smooth_weight=0.3,
-        boundary_threshold=0.1
-    )
     
-    # Option 2: Start with simplified version and gradually add complexity
-    # criterion = SimplifiedContinuousLoss(mse_weight=1.0, ssim_weight=0.5)
-    
-    logger.info(f"Using loss function: {criterion.__class__.__name__}")
-
     # Use AdamW optimizer (better than SGD for this task)
     optimizer = torch.optim.AdamW(
         model.parameters(), 
@@ -154,7 +138,7 @@ if __name__ == "__main__":
         eta_min=1e-6
     )
     for epoch in range(NUM_EPOCHS):
-        for episode_data in episode_generator(config, num_episodes=1):
+        for episode_data in episode_generator(config, num_episodes=2):
             episode_id = episode_data["episode_id"]
             instruction = episode_data["instruction"]
             frames = episode_data["frames"]
@@ -179,10 +163,6 @@ if __name__ == "__main__":
                     batch_frames = batch_frames.to("cuda" if torch.cuda.is_available() else "cpu")
                     batch_heatmaps = batch_heatmaps.to("cuda" if torch.cuda.is_available() else "cpu")
                     
-                    # Optional: Preprocess ground truth for better smoothness
-                    if PREPROCESS_GT:
-                        batch_heatmaps = prepare_ground_truth_heatmap(batch_heatmaps)
-                    
                     # Forward pass
                     pred_heatmap = model(batch_frames, batch_instruction)
                     
@@ -196,7 +176,13 @@ if __name__ == "__main__":
                         )
 
                     # Compute loss with new loss function
-                    total_loss, loss_dict = criterion(pred_heatmap, batch_heatmaps)
+                    total_loss, cost_loss, dir_loss = combined_navigation_loss(
+                                                                                pred_heatmap, 
+                                                                                batch_heatmaps,
+                                                                                occupancy_mask=None,
+                                                                                cost_weight=1.0,
+                                                                                dir_weight=0.5  # Adjust this to control smoothness
+                                                                            )
 
                     epoch_loss.append(total_loss)
 
@@ -218,11 +204,8 @@ if __name__ == "__main__":
                         # Logging
                         logger.info(
                             f"Episode {episode_id} | Step {step_count} | "
-                            f"Total Loss: {loss_dict['total']:.6f} | "
-                            f"MSE: {loss_dict['mse']:.6f} | "
-                            f"SSIM: {loss_dict['ssim']:.6f} | "
-                            f"Boundary: {loss_dict.get('boundary', 0):.6f} | "
-                            f"Smoothness: {loss_dict.get('smoothness', 0):.6f}"
+                            f"Total Loss: {total_loss}| cost_loss: {cost_loss}| dir_loss: {dir_loss}"
+
                         )
                         
                         batch_frames_np = batch_frames.detach().cpu().numpy()
@@ -234,7 +217,9 @@ if __name__ == "__main__":
                             "episode_id": episode_id,
                             "timestep": step_count,
                             "learning_rate": optimizer.param_groups[0]['lr'],
-                            **loss_dict,  # Log all loss components
+                            "total_loss": total_loss,
+                            "cost_loss": cost_loss,
+                            "dir_loss": dir_loss,
                             "gt_heatmap_batch": [wandb.Image(h.squeeze()*255) for h in batch_heatmaps_np[:4]],
                             "pred_heatmap_batch": [wandb.Image(h.squeeze()*255) for h in pred_heatmaps_np[:4]],
                         }

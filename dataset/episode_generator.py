@@ -14,17 +14,17 @@ from vlnce_baselines.config.default import get_config
 from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances, encode_normalized_distances_to_frame, save_norm_frame_heatmap
 
 
-def episode_generator(config, num_episodes=10):
+def episode_generator(env, num_episodes=10):
     """
     Generator that yields episode data one at a time.
     Yields per-episode frames and norm_frames without loading all episodes into memory.
     """
-    env = VLNCEDaggerEnv(config=config)
     follower = ShortestPathFollowerCompat(
         env._env.sim, goal_radius=0.5, return_one_hot=False
     )
     follower.mode = "geodesic_path"
-
+    
+    
     with tqdm.tqdm(total=num_episodes, desc="Collecting episodes") as pbar:
         for episode_idx in range(num_episodes):
             obs = env.reset()
