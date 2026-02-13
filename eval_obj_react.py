@@ -210,6 +210,33 @@ if __name__ == "__main__":
             frames = episode_data["frames"]
             norm_frames = episode_data["norm_frames"]
 
+            # After episode_generator completes, restore agent to initial position
+            # Get the episode's start position and rotation
+            current_episode = env._env.current_episode
+            start_position = current_episode.start_position
+            start_rotation = current_episode.start_rotation
+            
+            # Manually restore agent to start position (no reset needed)
+            sim = env._env.sim
+            agent = env._env.sim.get_agent(0)
+            agent_state = agent.state
+            agent_state.position = start_position
+            agent_state.rotation = start_rotation
+            agent.set_state(agent_state)
+            
+            # Reset environment's internal state counters
+            env._env._elapsed_steps = 0
+            env._env._episode_over = False
+            
+            # Clear trajectory history and reset all measurements (this clears the blue line)
+            env._env._task.measurements.reset_measures(
+                episode=current_episode, 
+                task=env._env.task
+            )
+            
+            # Recalculate observations from the restored initial position
+            obs = sim.get_sensor_observations()
+            
             if len(frames) != len(norm_frames):
                 print(f"Skipping episode {episode_id}: image and heatmap sequence lengths do not match.")
                 continue
@@ -234,7 +261,15 @@ if __name__ == "__main__":
                     v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
                     agent, sim, collided = apply_velocity(vel_control, agent, sim, velocity=v, steer=-w, time_step=0.1)
                     
-                    # Get observations after velocity update
+                    #Forces the environment to recalculate all metrics based on current simulator state.
+                    env._env._task.measurements.update_measures(
+                        episode=env._env.current_episode, 
+                        action={"action": "VELOCITY_CONTROL"},  # Dummy action
+                        task=env._env.task
+                    )
+                    env._env._update_step_stats()
+                    
+                    # Get observations and metrics after velocity update
                     obs = sim.get_sensor_observations()
                     info = env._env.get_metrics()
                     
