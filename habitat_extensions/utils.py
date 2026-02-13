@@ -61,6 +61,15 @@ def observations_to_image(
             interpolation=cv2.INTER_CUBIC,
         )
         egocentric_view.append(depth_map)
+    
+    if "vis_img" in observation:
+        vis_img = observation["vis_img"]
+        vis_img = cv2.resize(
+            vis_img,
+            dsize=(observation_size, observation_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        egocentric_view.append(vis_img)
 
     assert (
         len(egocentric_view) > 0

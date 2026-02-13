@@ -238,6 +238,8 @@ if __name__ == "__main__":
                     obs = sim.get_sensor_observations()
                     info = env._env.get_metrics()
                     
+                    #Adding Vis_img
+                    obs['vis_img'] = vis_img
                     # Create video frame
                     video_frame = observations_to_image(obs, info)
                     video_frame = append_text_to_image(video_frame, instruction)
