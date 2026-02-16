@@ -290,3 +290,19 @@ If you use the RxR-Habitat data, please additionally cite the following [paper](
   year={2020}
 }
 ```
+
+
+# Akash Added Semantic segmentations
+See the full details of the semantic sensor fix in [SEMANTIC_SENSOR_FIX.md](SEMANTIC_SENSOR_FIX.md).
+The semantic segmentation configuration must be mentioned like:
+```yaml
+SIMULATOR:
+  TURN_ANGLE: 30 #30
+  TILT_ANGLE: 30
+  ACTION_SPACE_CONFIG: v1
+  SCENE_DATASET: "data/scene_datasets/mp3d/mp3d.scene_dataset_config.json" <-- this
+``` 
+
+Refer to [this](https://github.com/facebookresearch/habitat-sim/blob/main/DATASETS.md#matterport3d-mp3d-dataset) for more details
+
+
