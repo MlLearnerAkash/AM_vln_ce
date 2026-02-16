@@ -14,6 +14,10 @@ import torch.nn.functional as F
 from pytorch_msssim import ssim
 from torch.utils.data import Dataset, DataLoader
 import yaml
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import cv2
 
 import habitat_sim
 
@@ -31,10 +35,36 @@ sys.path.append("/data/ws")
 from obj_rec_to_rank_predictor.src.rank_predictor import RankPredictor
 from obj_rec_to_rank_predictor.src.object_react import ObjRelLearntController
 
+def save_norm_frame_heatmap(image, heatmap, save_dir, filename, alpha=0.5):
+    """
+    Overlay a heatmap (values in [0,255]) on top of an RGB image and save to disk.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    # Normalize heatmap to [0, 255] and convert to uint8
+    hm = heatmap.astype(np.float32)
+    hm = (hm - hm.min()) / (hm.ptp() + 1e-8)
+    hm_uint8 = np.uint8(hm * 255)
+    # Apply colormap
+    heatmap_color = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_VIRIDIS)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    # Ensure image is uint8 in [0,255]
+    if image.dtype != np.uint8:
+        img = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+    else:
+        img = image
+    # Resize heatmap if needed
+    if heatmap_color.shape[:2] != img.shape[:2]:
+        heatmap_color = cv2.resize(heatmap_color, (img.shape[1], img.shape[0]))
+    # Overlay
+    overlay = cv2.addWeighted(img, 1 - alpha, heatmap_color, alpha, 0)
+    save_path = os.path.join(save_dir, filename)
+    cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    return save_path
 
 def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
     frames_dir = os.path.join(temp_dir, "frames")
     norm_frames_dir = os.path.join(temp_dir, "norm_frames")
+    heatmap_dir= os.path.join(temp_dir, "heatmap")
     os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(norm_frames_dir, exist_ok=True)
 
@@ -55,6 +85,7 @@ def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
             Image.fromarray(arr).save(norm_path)
         norm_frame_paths.append(norm_path)
 
+        save_norm_frame_heatmap(frame, norm_frame, heatmap_dir, f"norm_frame_{idx}.png")
     return frame_paths, norm_frame_paths
 
 def prepare_ground_truth_heatmap(heatmap_tensor):
@@ -248,12 +279,10 @@ if __name__ == "__main__":
                 frame_paths, norm_frame_paths = save_numpy_images_to_temp(frames, norm_frames, temp_dir)
                 instruction = episode_data["instruction"]
 
+
                 for frame_path, heatmap_path in zip(frame_paths, norm_frame_paths):
                     frame = np.array(Image.open(frame_path))
-                    # frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).float()
-                    # device = "cuda" if torch.cuda.is_available() else "cpu"
-                    # frame_tensor = frame_tensor.to(device)
-                
+
                     # Forward pass for a single image
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
                     mask, pls= get_goal_image(frame, pred_heatmap)
@@ -298,9 +327,5 @@ if __name__ == "__main__":
                     tb_writer=None,
                 )
                 logger.info(f"Video saved for episode: {episode_id}, steps: {step_count}")
-
-                    
-
-
 
     wandb.finish()

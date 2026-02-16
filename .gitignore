@@ -147,3 +147,4 @@ stats_*.json
 sbatch_scripts
 reference_path_videos
 chkpt
+wandb
