@@ -61,17 +61,20 @@ def save_norm_frame_heatmap(image, heatmap, save_dir, filename, alpha=0.5):
     cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     return save_path
 
-def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
+def save_numpy_images_to_temp(frames,semantic_frames, norm_frames, temp_dir):
     frames_dir = os.path.join(temp_dir, "frames")
     norm_frames_dir = os.path.join(temp_dir, "norm_frames")
-    heatmap_dir= os.path.join(temp_dir, "heatmap")
+    semantic_dir= os.path.join(temp_dir, "semantics")
+
     os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(norm_frames_dir, exist_ok=True)
+    os.makedirs(semantic_dir, exist_ok= True)
 
     frame_paths = []
     norm_frame_paths = []
+    semantic_paths= []
 
-    for idx, (frame, norm_frame) in enumerate(zip(frames, norm_frames)):
+    for idx, (frame, semantic_frame, norm_frame) in enumerate(zip(frames, semantic_frames, norm_frames)):
         frame_path = os.path.join(frames_dir, f"frame_{idx}.png")
         if isinstance(frame, np.ndarray):
             Image.fromarray(frame).save(frame_path)
@@ -85,8 +88,13 @@ def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
             Image.fromarray(arr).save(norm_path)
         norm_frame_paths.append(norm_path)
 
+        semantic_path = os.path.join(semantic_dir, f"semantic_{idx}.npy")
+        if isinstance(semantic_frame, np.ndarray):
+            np.save(semantic_path, semantic_frame.astype(np.int32))  # preserve exact IDs
+        semantic_paths.append(semantic_path)
+
         # save_norm_frame_heatmap(frame, norm_frame, heatmap_dir, f"norm_frame_{idx}.png")
-    return frame_paths, norm_frame_paths
+    return frame_paths, semantic_paths, norm_frame_paths
 
 def prepare_ground_truth_heatmap(heatmap_tensor):
     """
@@ -126,46 +134,65 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return config
 
-def get_goal_image(image, heatmap, patch_grid=(7, 7), target_size=(21, 16), dims=8):
-    H, W = image.shape[:2]
-    patch_h = H // patch_grid[0]
-    patch_w = W // patch_grid[1]
-    device = heatmap.device
-    
-    # Convert image to tensor
-    image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0  # (3, H, W)
-    image_tensor = image_tensor.unsqueeze(0).to(device)
-    
-    # Calculate number of patches
-    num_patches = patch_grid[0] * patch_grid[1]  # 49
-    
-    # Create masks array (49, 120, 160) - target size scaled
-    target_h, target_w = 120, 160  # H/4, W/4
-    masks = np.zeros((num_patches, target_h, target_w), dtype=np.uint8)
-    
-    # Calculate patch size in target coordinates
+def get_goal_image(image, heatmap, patch_grid=(7, 7), target_size=(120, 160), dims=8):
+    target_h, target_w = target_size
+
+    # ── Step 1: Scale heatmap patch values to [0, 200] ──────────────────────
+    cost_values = heatmap[0].flatten().cpu().numpy()        # (49,)
+    pls = (cost_values * 200).astype(np.float32)            # (49,) in [0, 200]
+
+    # ── Step 2: Resize semantic map → target_size (NEAREST keeps integer IDs) 
+    semantic_resized = cv2.resize(
+        semantic_map.astype(np.float32),
+        (target_w, target_h),
+        interpolation=cv2.INTER_NEAREST
+    ).astype(np.int32)                                      # (target_h, target_w)
+
+    # ── Step 3: Build spatial patch costmap (target_h, target_w) ────────────
+    patch_costmap = np.zeros((target_h, target_w), dtype=np.float32)
     target_patch_h = target_h // patch_grid[0]
     target_patch_w = target_w // patch_grid[1]
-    
-    # Create mask for each patch
+
     patch_idx = 0
     for i in range(patch_grid[0]):
         for j in range(patch_grid[1]):
-            # Calculate patch boundaries in target space
             y_start = i * target_patch_h
-            y_end = (i + 1) * target_patch_h if i < patch_grid[0] - 1 else target_h
+            y_end   = (i + 1) * target_patch_h if i < patch_grid[0] - 1 else target_h
             x_start = j * target_patch_w
-            x_end = (j + 1) * target_patch_w if j < patch_grid[1] - 1 else target_w
-            
-            # Set mask to 1 only for this patch region
-            masks[patch_idx, y_start:y_end, x_start:x_end] = 1
-            
+            x_end   = (j + 1) * target_patch_w if j < patch_grid[1] - 1 else target_w
+            patch_costmap[y_start:y_end, x_start:x_end] = pls[patch_idx]
             patch_idx += 1
-    
-    # Calculate PLS from heatmap (costmap logic)
-    cost_values = heatmap[0].flatten().cpu().numpy()  # (49,)
-    pls = (cost_values * 200).astype(np.uint8)  # Scale to [0, 200]
-    return masks, pls
+
+    # ── Step 4: Get unique objects — skip background (ID = 0) ───────────────
+    unique_objects = [int(obj) for obj in np.unique(semantic_resized) if obj != 0]
+    N = len(unique_objects)                                 # number of objects in frame
+    object_cost_pairs = []                                  # [(obj_id, cost), ...]
+
+    for obj_id in unique_objects:
+        obj_mask = (semantic_resized == obj_id)             # (target_h, target_w) bool
+        aggregated_cost = float(np.mean(patch_costmap[obj_mask]))
+        object_cost_pairs.append((obj_id, aggregated_cost))
+
+    # ── Step 6: Sort objects by cost DESCENDING ──────────────────────────────
+    object_cost_pairs.sort(key=lambda x: x[1], reverse=True)
+    # [(obj_id_highest_cost, cost), ..., (obj_id_lowest_cost, cost)]
+
+    # ── Step 7: Build (N, target_h, target_w) costmap in descending order ───
+    costmap = np.zeros((N, target_h, target_w), dtype=np.float32)
+    sorted_object_ids  = []
+    sorted_object_costs = []
+
+    for ch_idx, (obj_id, aggregated_cost) in enumerate(object_cost_pairs):
+        obj_mask = (semantic_resized == obj_id)
+        costmap[ch_idx][obj_mask] = aggregated_cost        # fill object pixels with cost
+        sorted_object_ids.append(obj_id)
+        sorted_object_costs.append(aggregated_cost)
+
+    # pls: patch costs in ascending order  → (49,)  [low → high]
+    # sorted_object_costs: per-object costs in descending order → (N,) [high → low]
+    pls_assigned = np.array(sorted_object_costs, dtype=np.float32)  # only assigned values
+
+    return costmap, pls_assigned
 
 
 
@@ -240,6 +267,7 @@ if __name__ == "__main__":
             instruction = episode_data["instruction"]
             frames = episode_data["frames"]
             norm_frames = episode_data["norm_frames"]
+            semantic_frames= episode_data["semantic_frames"]
 
             # After episode_generator completes, restore agent to initial position
             # Get the episode's start position and rotation
@@ -276,12 +304,13 @@ if __name__ == "__main__":
             video_frames = []  # Collect frames for video generation
             
             with tempfile.TemporaryDirectory(prefix=f"episode_{episode_id}_") as temp_dir:
-                frame_paths, norm_frame_paths = save_numpy_images_to_temp(frames, norm_frames, temp_dir)
+                frame_paths, semantic_paths, norm_frame_paths = save_numpy_images_to_temp(frames, semantic_frames, norm_frames, temp_dir)
                 instruction = episode_data["instruction"]
 
 
-                for frame_path, heatmap_path in zip(frame_paths, norm_frame_paths):
+                for frame_path,semantic_path, heatmap_path in zip(frame_paths,semantic_paths, norm_frame_paths):
                     frame = np.array(Image.open(frame_path))
+                    semantic_map  = np.load(semantic_path)
 
                     # Forward pass for a single image
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)

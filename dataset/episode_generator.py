@@ -69,7 +69,7 @@ def episode_generator(env, num_episodes=10):
 
             frames = []
             norm_frames = []
-
+            semantic_frames= []
             for point in reference_path:
                 while not env._env.episode_over:
                     best_action = follower.get_next_action(point)
@@ -164,6 +164,7 @@ def episode_generator(env, num_episodes=10):
 
                     frames.append(frame)
                     norm_frames.append(norm_frame)
+                    semantic_frames.append(semantic_frame)
 
                     if done:
                         break
@@ -176,6 +177,7 @@ def episode_generator(env, num_episodes=10):
                 "instruction": instruction,
                 "frames": frames,
                 "norm_frames": norm_frames,
+                "semantic_frames": semantic_frames
             }
 
             pbar.update()
