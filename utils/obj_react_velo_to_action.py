@@ -19,7 +19,7 @@ from habitat_sim.utils.common import quat_to_magnum, quat_from_magnum
 def apply_velocity(vel_control, agent, sim, velocity, steer, time_step):
     # Update position
     forward_vec = habitat_sim.utils.quat_rotate_vector(agent.state.rotation, np.array([0, 0, -1.0]))
-    new_position = agent.state.position + forward_vec * velocity#*100
+    new_position = agent.state.position + forward_vec * velocity*20
 
     # Update rotation
     new_rotation = habitat_sim.utils.quat_from_angle_axis(steer, np.array([0, 1.0, 0]))

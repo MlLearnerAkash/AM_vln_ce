@@ -78,10 +78,11 @@ def episode_generator(env, num_episodes=10):
 
                     obs, _, done, info = env.step(best_action)
                     
-                    #NOTE: Need to change the frame
+                    
                     frame= obs["rgb"]
                     semantic_frame = obs["semantic"]
-                    semantic_frame= make_semantic(obs['semantic'])
+                    # semantic_frame= make_semantic(obs['semantic'])
+                    #NOTE: To visualize the semantics
                     # alpha = 0.7
                     # rgb = np.asarray(frame).astype(np.float32)
                     # sem = np.asarray(semantic_frame).astype(np.int32)
@@ -150,11 +151,11 @@ def episode_generator(env, num_episodes=10):
                     # overlay = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
 
 
-                    out_dir = "/data/ws/VLN-CE/dataset/semantics"
-                    overlay_path = f"{out_dir}/semantic_overlay_ep{episode_id}_step{len(frames)}.png"
-                    plt.imsave(overlay_path, semantic_frame)
-                    #NOTE: need to change the inf value to some other value
-                    frame = observations_to_image(obs, info)
+                    # out_dir = "/data/ws/VLN-CE/dataset/semantics"
+                    # overlay_path = f"{out_dir}/semantic_overlay_ep{episode_id}_step{len(frames)}.png"
+                    # plt.imsave(overlay_path, semantic_frame)
+                    # #NOTE: need to change the inf value to some other value
+                    # frame = observations_to_image(obs, info)
                     distances = get_object_geodesic_distances(env, semantic_frame)
                     
                     norm_frame = encode_normalized_distances_to_frame(

@@ -85,7 +85,7 @@ def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
             Image.fromarray(arr).save(norm_path)
         norm_frame_paths.append(norm_path)
 
-        save_norm_frame_heatmap(frame, norm_frame, heatmap_dir, f"norm_frame_{idx}.png")
+        # save_norm_frame_heatmap(frame, norm_frame, heatmap_dir, f"norm_frame_{idx}.png")
     return frame_paths, norm_frame_paths
 
 def prepare_ground_truth_heatmap(heatmap_tensor):
@@ -170,7 +170,7 @@ def get_goal_image(image, heatmap, patch_grid=(7, 7), target_size=(21, 16), dims
 
 
 if __name__ == "__main__":
-    NUM_EPOCHS= 1000
+    NUM_EPOCHS= 1
     ACCUMULATION_STEPS = 1
     PREPROCESS_GT = False  # Set to True to apply bilateral filtering to GT heatmaps
     

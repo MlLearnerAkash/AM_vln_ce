@@ -148,3 +148,4 @@ sbatch_scripts
 reference_path_videos
 chkpt
 wandb
+dataset/semantics
