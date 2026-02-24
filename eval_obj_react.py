@@ -195,7 +195,6 @@ def get_goal_image(image, heatmap, patch_grid=(7, 7), target_size=(120, 160), di
     return costmap, pls_assigned
 
 
-
 if __name__ == "__main__":
     NUM_EPOCHS= 1
     ACCUMULATION_STEPS = 1
@@ -309,14 +308,28 @@ if __name__ == "__main__":
 
 
                 for frame_path,semantic_path, heatmap_path in zip(frame_paths,semantic_paths, norm_frame_paths):
-                    frame = np.array(Image.open(frame_path))
+                    
+                    #NOTE: GT semantic map
                     semantic_map  = np.load(semantic_path)
+                    frame = np.array(Image.open(frame_path))
+
+                    gt_heatmap= np.array(Image.open(heatmap_path).convert("L")).astype(np.float32)
+                    gt_heatmap_img = np.array(Image.open(heatmap_path).convert("L")).astype(np.float32)
+                    gt_heatmap_img = (gt_heatmap_img - gt_heatmap_img.min()) / (gt_heatmap_img.ptp() + 1e-8)
+                    gt_heatmap_resized = cv2.resize(gt_heatmap_img, (7, 7), interpolation=cv2.INTER_AREA)
+                    gt_heatmap = torch.from_numpy(gt_heatmap_resized).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")
+
+                    #NOTE: frame/semenaitcs from current obseravtions
+                    # obs = sim.get_sensor_observations()
+                    # frame= np.array(obs["rgb"])
+                    # semantic_map = obs["semantic"].astype(np.int32)
 
                     # Forward pass for a single image
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
-                    mask, pls= get_goal_image(frame, pred_heatmap)
+                    mask, pls= get_goal_image(frame, gt_heatmap) #pred_heatmap
 
                     v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
+                    #NOTE: For object react actions
                     agent, sim, collided = apply_velocity(vel_control, agent, sim, velocity=v, steer=-w, time_step=0.1)
                     
                     #Forces the environment to recalculate all metrics based on current simulator state.
@@ -325,6 +338,31 @@ if __name__ == "__main__":
                         action={"action": "VELOCITY_CONTROL"},  # Dummy action
                         task=env._env.task
                     )
+                    
+                    # threshold_linear = 0.01
+                    # threshold_angular = 0.1
+                    # abs_w = abs(w)
+                    # if abs_w > threshold_angular:
+                    #     if w > 0:
+                    #         action = {"action": "TURN_LEFT"}
+                    #     else:
+                    #         action = {"action": "TURN_RIGHT"}
+                    # elif v > threshold_linear:
+                    #     action = {"action": "MOVE_FORWARD"}
+                    # else:
+                    #     action = {"action": "STOP"}
+
+                    # logger.info(f"Action: {action['action']} | v={v:.3f}, w={w:.3f}")
+                    # obs, reward, done, info = env.step(action)
+                    # if done:
+                    #     logger.info(f"Episode {episode_id} ended at step {step_count}")
+                    #     break
+                    # #Forces the environment to recalculate all metrics based on current simulator state.
+                    # env._env._task.measurements.update_measures(
+                    #     episode=env._env.current_episode, 
+                    #     action=action,
+                    #     task=env._env.task
+                    # )
                     env._env._update_step_stats()
                     
                     # Get observations and metrics after velocity update

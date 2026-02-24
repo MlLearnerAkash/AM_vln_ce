@@ -16,13 +16,15 @@ import matplotlib.pyplot as plt
 import habitat_sim
 from habitat_sim.utils.common import quat_to_magnum, quat_from_magnum
 
-def apply_velocity(vel_control, agent, sim, velocity, steer, time_step):
+
+
+def apply_velocity(vel_control, agent, sim, velocity, steer, time_step, translation_gain= 10.0, rotation_gain= 2.0):
     # Update position
     forward_vec = habitat_sim.utils.quat_rotate_vector(agent.state.rotation, np.array([0, 0, -1.0]))
-    new_position = agent.state.position + forward_vec * velocity*20
+    new_position = agent.state.position + forward_vec * velocity*translation_gain #*20
 
     # Update rotation
-    new_rotation = habitat_sim.utils.quat_from_angle_axis(steer, np.array([0, 1.0, 0]))
+    new_rotation = habitat_sim.utils.quat_from_angle_axis(steer*rotation_gain, np.array([0, 1.0, 0]))
     new_rotation = new_rotation * agent.state.rotation
 
     # Step the physics simulation
@@ -73,3 +75,4 @@ def apply_velocity(vel_control, agent, sim, velocity, steer, time_step):
     sim.step_physics(dt=time_step)
 
     return agent, sim, collided
+
