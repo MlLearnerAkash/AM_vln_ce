@@ -126,10 +126,16 @@ class LangGeoNetDataset(Dataset):
         class_ids = np.load(os.path.join(sample["frame_dir"], "class_ids.npy"))
         geodesic = np.load(os.path.join(sample["frame_dir"], "geodesic_distances.npy"))
 
-        K = min(masks.shape[0], self.max_objects)
-        masks = torch.from_numpy(masks[:K]).bool()
-        class_ids = torch.from_numpy(class_ids[:K]).long()
-        geodesic = torch.from_numpy(geodesic[:K]).float()
+        # Filter empty masks (all-zero rows) before passing to model
+        valid = masks.any(axis=(1, 2))           # [K] bool
+        masks = masks[valid]
+        class_ids = class_ids[valid]
+        geodesic = geodesic[valid]
+        K = masks.shape[0]                        # actual number of valid objects
+
+        masks = torch.from_numpy(masks).bool()
+        class_ids = torch.from_numpy(class_ids).long()
+        geodesic = torch.from_numpy(geodesic).float()
 
         return {
             "pixel_values": pixel_values,         # [3, 224, 224]

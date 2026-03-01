@@ -25,15 +25,15 @@ class MaskedObjectPooling(nn.Module):
     """
     Extracts per-object features from a visual feature map using instance masks.
     For each object mask, performs masked average pooling over the spatial feature map,
-    then concatenates geometric features and class embeddings.
+    then concatenates geometric features.
     """
 
-    def __init__(self, visual_dim, geom_dim=5, class_embed_dim=64, num_classes=150, out_dim=256):
+    def __init__(self, visual_dim, geom_dim=5, out_dim=256):  # ← removed class_embed_dim, num_classes
         super().__init__()
         self.out_dim = out_dim
-        self.class_embedding = nn.Embedding(num_classes, class_embed_dim)
+        # ← removed: self.class_embedding = nn.Embedding(num_classes, class_embed_dim)
         self.projection = nn.Sequential(
-            nn.Linear(visual_dim + class_embed_dim + geom_dim, out_dim),
+            nn.Linear(visual_dim + geom_dim, out_dim),  # ← removed class_embed_dim
             nn.GELU(),
             nn.LayerNorm(out_dim),
             nn.Linear(out_dim, out_dim),
@@ -73,24 +73,21 @@ class MaskedObjectPooling(nn.Module):
 
         return geom_feats
 
-    def forward(self, feature_map, masks, class_ids):
+    def forward(self, feature_map, masks, class_ids=None):  # ← class_ids now unused
         """
         Args:
             feature_map: [B, N_patches, D] CLIP ViT patch features
             masks:       list of [K_b, H, W] binary masks per batch item
-            class_ids:   list of [K_b] class IDs per batch item
+            class_ids:   ignored, kept for API compatibility
 
         Returns:
             object_features: list of [K_b, out_dim] per batch item
         """
-        
-
         batch_size = len(masks)
         all_obj_feats = []
 
         for b in range(batch_size):
             mask_b = masks[b]    # [K, H, W]
-            class_b = class_ids[b]  # [K]
             K = mask_b.shape[0]
 
             if K == 0:
@@ -98,13 +95,6 @@ class MaskedObjectPooling(nn.Module):
                     torch.zeros(0, self.out_dim, device=feature_map.device)
                 )
                 continue
-
-            # n_emb = self.class_embedding.num_embeddings
-            # invalid = (class_b < 0) | (class_b >= n_emb)
-            # if invalid.any():
-            #     print(f"[WARN] batch {b}: invalid class_ids {class_b[invalid].tolist()} "
-            #           f"(num_embeddings={n_emb}), clamping.")
-            # class_b = class_b.clamp(0, n_emb - 1)
 
             feat = feature_map[b]  # [N_patches, D]
             N, D = feat.shape
@@ -127,12 +117,9 @@ class MaskedObjectPooling(nn.Module):
             # Geometric features
             geom = self.compute_geometric_features(mask_b)  # [K, 5]
 
-            # Class embedding
-            cls_emb = self.class_embedding(class_b)  # [K, class_embed_dim]
-
-            # Concatenate and project
-            combined = torch.cat([pooled, cls_emb, geom], dim=-1)
-            obj_feat = self.projection(combined)  # [K, out_dim]
+            # Concatenate pooled + geom only, then project
+            combined = torch.cat([pooled, geom], dim=-1)   # ← removed cls_emb
+            obj_feat = self.projection(combined)            # [K, out_dim]
 
             all_obj_feats.append(obj_feat)
 
@@ -239,7 +226,7 @@ class LangGeoNet(nn.Module):
         n_layers=6,
         d_ff=1024,
         dropout=0.1,
-        num_classes=150,
+        num_classes=None,       # ← no longer used, kept for compat
         clip_model_name="openai/clip-vit-base-patch16",
         freeze_clip=True,
         max_objects=50,
@@ -260,13 +247,11 @@ class LangGeoNet(nn.Module):
         self.visual_proj = nn.Linear(self.clip_visual_dim, d_model)
         self.lang_proj = nn.Linear(self.clip_text_dim, d_model)
 
-        # ========== Object Encoder ==========
+        # ========== Object Encoder (no class embedding) ==========
         self.object_encoder = MaskedObjectPooling(
             visual_dim=d_model,
             geom_dim=5,
-            class_embed_dim=64,
-            num_classes=num_classes,
-            out_dim=d_model,
+            out_dim=d_model,    # ← removed class_embed_dim, num_classes
         )
 
         # ========== Type + Position Embeddings ==========
@@ -345,7 +330,7 @@ class LangGeoNet(nn.Module):
 
         # --- Pad objects to [B, K_max, d] ---
         K_counts = [f.shape[0] for f in obj_feats_list]
-        K_max = min(max(K_counts), self.max_objects) if K_counts else 1
+        K_max = max(K_counts) if K_counts else 1  # no hard cap — use actual max
 
         obj_padded = torch.zeros(B, K_max, self.d_model, device=device)
         obj_mask = torch.zeros(B, K_max, dtype=torch.bool, device=device)
@@ -357,7 +342,15 @@ class LangGeoNet(nn.Module):
                 obj_mask[b, :K_b] = True
 
         # --- Add type + position embeddings ---
-        obj_tokens = obj_padded + self.obj_type_embed + self.obj_pos_embed[:, :K_max]
+        # Interpolate positional embeddings if K_max exceeds the trained max_objects size
+        if K_max <= self.max_objects:
+            pos_embed = self.obj_pos_embed[:, :K_max]          # [1, K_max, d]
+        else:
+            pos_embed = F.interpolate(
+                self.obj_pos_embed.permute(0, 2, 1),           # [1, d, max_objects]
+                size=K_max, mode='linear', align_corners=False
+            ).permute(0, 2, 1)                                  # [1, K_max, d]
+        obj_tokens = obj_padded + self.obj_type_embed + pos_embed
         lang_tokens = lang_feats + self.lang_type_embed
 
         # --- Cross-modal transformer ---
@@ -390,14 +383,12 @@ def build_langgeonet(
     d_model=256,
     n_heads=8,
     n_layers=6,
-    num_classes=151,
+    num_classes=None,           # ← no longer needed
     clip_model="openai/clip-vit-base-patch16",
 ):
-    """Build LangGeoNet with default config."""
     return LangGeoNet(
         d_model=d_model,
         n_heads=n_heads,
         n_layers=n_layers,
-        num_classes=num_classes,
         clip_model_name=clip_model,
     )

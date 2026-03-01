@@ -24,7 +24,7 @@ from PIL import Image
 
 import torch
 import torch.nn.functional as F
-from transformers import CLIPProcessor, BertTokenizer
+from transformers import CLIPProcessor  # ← removed BertTokenizer
 
 from model import LangGeoNet
 
@@ -35,36 +35,27 @@ class LangGeoNetPredictor:
     """
 
     def __init__(self, checkpoint_path, device=None):
-        """
-        Args:
-            checkpoint_path: path to saved .pt checkpoint
-            device: 'cuda', 'cpu', or None (auto-detect)
-        """
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
 
-        # Load checkpoint & config
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         cfg = ckpt["config"]
 
-        # Build model from saved config
+        # Build model — no num_classes needed
         self.model = LangGeoNet(
             d_model=cfg["d_model"],
             n_heads=cfg["n_heads"],
             n_layers=cfg["n_layers"],
-            num_classes=cfg["num_classes"],
-            clip_model_name=cfg["clip_model"],
-            bert_model_name=cfg["bert_model"],
+            clip_model_name=cfg["clip_model"],  # ← removed num_classes
         )
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model = self.model.to(self.device)
         self.model.eval()
 
-        # Tokenizer / processor (same as training)
+        # CLIP processor handles both image and text tokenization
         self.clip_processor = CLIPProcessor.from_pretrained(cfg["clip_model"])
-        self.bert_tokenizer = BertTokenizer.from_pretrained(cfg["bert_model"])
 
         print(f"[LangGeoNetPredictor] Loaded epoch {ckpt['epoch']} "
               f"(val MAE={ckpt.get('best_val_mae', '?'):.4f}) on {self.device}")
@@ -74,83 +65,72 @@ class LangGeoNetPredictor:
     # ----------------------------------------------------------
 
     @torch.no_grad()
-    def predict_frame(self, image, masks, class_ids, instruction):
+    def predict_frame(self, image, masks, instruction):
         """
-        Predict geodesic distance for every object in ONE frame.
-
         Args:
-            image:       PIL.Image  or  np.ndarray [H, W, 3] (uint8 RGB)
-            masks:       np.ndarray [K, H, W] bool/uint8 instance masks
-            class_ids:   np.ndarray [K] int class IDs
-            instruction: str, the navigation instruction
+            image:       PIL.Image or np.ndarray [H, W, 3]
+            masks:       np.ndarray [K, H, W]
+            instruction: str
 
         Returns:
-            distances: np.ndarray [K]  predicted normalized geodesic ∈ [0,1]
-            costmap:   np.ndarray [H, W] float32, each pixel = its object's distance
-            attn_map:  np.ndarray [K, L_actual] cross-attention weights (last layer)
+            distances: np.ndarray [K]
+            costmap:   np.ndarray [H, W]
+            attn_map:  np.ndarray [K, L_actual] or None
         """
-        # --- preprocess image ---
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
-        pixel_values = self.clip_processor(
-            images=image, return_tensors="pt"
-        )["pixel_values"].to(self.device)  # [1, 3, 224, 224]
 
-        # --- preprocess instruction ---
-        enc = self.bert_tokenizer(
-            instruction, max_length=128, padding="max_length",
-            truncation=True, return_tensors="pt",
+        enc = self.clip_processor(
+            images=image,
+            text=instruction,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=77,
+            truncation=True,
         )
-        input_ids = enc["input_ids"].to(self.device)            # [1, L]
-        attention_mask = enc["attention_mask"].to(self.device)   # [1, L]
+        pixel_values   = enc["pixel_values"].to(self.device)   # [1, 3, 224, 224]
+        input_ids      = enc["input_ids"].to(self.device)       # [1, 77]
+        attention_mask = enc["attention_mask"].to(self.device)  # [1, 77]
 
-        # --- preprocess masks ---
-        masks_t = torch.from_numpy(masks.astype(bool)).to(self.device)     # [K, H, W]
-        class_ids_t = torch.from_numpy(class_ids.astype(np.int64)).to(self.device)  # [K]
+        # Filter out empty masks (all-zero) — these cause spurious extra predictions
+        valid = masks.any(axis=(1, 2))          # [K] bool
+        masks = masks[valid]                    # [K_valid, H, W]
 
-        # --- forward ---
+        if masks.shape[0] == 0:
+            H, W = masks.shape[1], masks.shape[2] if masks.ndim == 3 else (image.height, image.width)
+            return np.array([]), np.ones((H, W), dtype=np.float32), None
+
+        masks_t = torch.from_numpy(masks.astype(bool)).to(self.device)  # [K_valid, H, W]
+
         predictions, attn_weights_all = self.model(
             images=pixel_values,
             masks_list=[masks_t],
-            class_ids_list=[class_ids_t],
+            class_ids_list=None,   # ← not used anymore
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
         distances = predictions[0].cpu().numpy()  # [K]
 
-        # --- build WayObject Costmap ---
         K, H, W = masks.shape
-        costmap = np.ones((H, W), dtype=np.float32)  # background = 1.0
+        costmap = np.ones((H, W), dtype=np.float32)
         for k in range(K):
             costmap[masks[k] > 0] = distances[k]
 
-        # --- extract attention (last layer) ---
         attn_map = None
         if attn_weights_all:
-            last = attn_weights_all[-1]  # [1, K_padded, L]
+            last = attn_weights_all[-1]
             L_actual = int(attention_mask.sum().item())
-            attn_map = last[0, :K, :L_actual].cpu().numpy()  # [K, L_actual]
+            attn_map = last[0, :K, :L_actual].cpu().numpy()
 
         return distances, costmap, attn_map
 
     # ----------------------------------------------------------
-    # Episode-level (all frames share one instruction)
+    # Episode-level
     # ----------------------------------------------------------
 
     @torch.no_grad()
     def predict_episode(self, episode_dir):
-        """
-        Run inference on all frames of an episode.
-
-        Args:
-            episode_dir: path containing instruction.txt + frame_*/
-
-        Returns:
-            results: list of dicts, one per frame:
-                { "distances": [K], "costmap": [H,W], "frame_dir": str }
-        """
-        # Read instruction
         with open(os.path.join(episode_dir, "instruction.txt")) as f:
             instruction = f.read().strip()
 
@@ -158,94 +138,77 @@ class LangGeoNetPredictor:
         results = []
 
         for frame_dir in frame_dirs:
-            rgb_path = os.path.join(frame_dir, "rgb.png")
+            rgb_path   = os.path.join(frame_dir, "rgb.png")
             masks_path = os.path.join(frame_dir, "masks.npy")
-            cids_path = os.path.join(frame_dir, "class_ids.npy")
 
-            if not all(os.path.exists(p) for p in [rgb_path, masks_path, cids_path]):
+            if not all(os.path.exists(p) for p in [rgb_path, masks_path]):  # ← removed cids_path check
                 continue
 
             image = Image.open(rgb_path).convert("RGB")
             masks = np.load(masks_path)
-            class_ids = np.load(cids_path)
+            # ← removed: class_ids = np.load(cids_path)
 
-            distances, costmap, attn = self.predict_frame(
-                image, masks, class_ids, instruction
-            )
-
+            distances, costmap, attn = self.predict_frame(image, masks, instruction)  # ← removed class_ids
             results.append({
                 "frame_dir": frame_dir,
                 "distances": distances,
-                "costmap": costmap,
-                "attn_map": attn,
+                "costmap":   costmap,
+                "attn_map":  attn,
             })
 
         return instruction, results
 
     # ----------------------------------------------------------
-    # Batch prediction (multiple frames, same instruction)
+    # Batch prediction
     # ----------------------------------------------------------
 
     @torch.no_grad()
-    def predict_batch(self, images, masks_list, class_ids_list, instruction):
-        """
-        Predict geodesic distances for a BATCH of frames (shared instruction).
-
-        This is more efficient than calling predict_frame() in a loop because
-        the language encoder runs once and the visual encoder processes all
-        frames in parallel.
-
-        Args:
-            images:         list of PIL.Image (len B)
-            masks_list:     list of np.ndarray [K_b, H, W] (len B)
-            class_ids_list: list of np.ndarray [K_b] (len B)
-            instruction:    str (shared)
-
-        Returns:
-            all_distances: list of np.ndarray [K_b] (len B)
-            all_costmaps:  list of np.ndarray [H, W] (len B)
-        """
+    def predict_batch(self, images, masks_list, instruction):  # ← removed class_ids_list
         B = len(images)
 
-        # --- preprocess images ---
-        pv_list = []
-        for img in images:
-            if isinstance(img, np.ndarray):
-                img = Image.fromarray(img)
-            pv = self.clip_processor(images=img, return_tensors="pt")["pixel_values"]
-            pv_list.append(pv.squeeze(0))
-        pixel_values = torch.stack(pv_list).to(self.device)  # [B, 3, 224, 224]
+        pil_images = [
+            Image.fromarray(img) if isinstance(img, np.ndarray) else img
+            for img in images
+        ]
 
-        # --- preprocess instruction (same for all frames) ---
-        enc = self.bert_tokenizer(
-            [instruction] * B, max_length=128, padding="max_length",
-            truncation=True, return_tensors="pt",
+        enc = self.clip_processor(
+            images=pil_images,
+            text=[instruction] * B,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=77,
+            truncation=True,
         )
-        input_ids = enc["input_ids"].to(self.device)
+        pixel_values   = enc["pixel_values"].to(self.device)
+        input_ids      = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
 
-        # --- preprocess masks ---
-        masks_t = [torch.from_numpy(m.astype(bool)).to(self.device) for m in masks_list]
-        cids_t = [torch.from_numpy(c.astype(np.int64)).to(self.device) for c in class_ids_list]
+        # Filter empty masks per batch item
+        filtered_masks = []
+        valid_indices = []
+        for m in masks_list:
+            valid = m.any(axis=(1, 2)) if isinstance(m, np.ndarray) else m.any(dim=(1, 2))
+            filtered_masks.append(m[valid])
+            valid_indices.append(valid)
 
-        # --- forward ---
+        masks_t = [torch.from_numpy(m.astype(bool)).to(self.device) for m in filtered_masks]
+
         predictions, _ = self.model(
             images=pixel_values,
             masks_list=masks_t,
-            class_ids_list=cids_t,
+            class_ids_list=None,   # ← not used anymore
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        all_distances = []
-        all_costmaps = []
-
+        all_distances, all_costmaps = [], []
         for b in range(B):
             dists = predictions[b].cpu().numpy()
-            K, H, W = masks_list[b].shape
+            m = filtered_masks[b]               # already filtered
+            K, H, W = m.shape
             costmap = np.ones((H, W), dtype=np.float32)
             for k in range(K):
-                costmap[masks_list[b][k] > 0] = dists[k]
+                costmap[m[k] > 0] = dists[k]
             all_distances.append(dists)
             all_costmaps.append(costmap)
 
@@ -350,8 +313,10 @@ def visualize_attention(instruction, attn_weights, object_labels, save_path=None
     """Heatmap: which instruction tokens each object attends to."""
     import matplotlib.pyplot as plt
 
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    tokens = ["[CLS]"] + tokenizer.tokenize(instruction) + ["[SEP]"]
+    # ← use CLIP tokenizer instead of BertTokenizer
+    from transformers import CLIPTokenizer
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+    tokens = tokenizer.tokenize(instruction)
 
     K, L = attn_weights.shape
     L_show = min(L, len(tokens))
@@ -375,7 +340,7 @@ def visualize_attention(instruction, attn_weights, object_labels, save_path=None
 
 
 # ==============================================================
-# Dataset-level Evaluation
+# Dataset-level Evaluation & CLI
 # ==============================================================
 
 def evaluate_dataset(predictor, data_root, split="val"):
@@ -398,13 +363,12 @@ def evaluate_dataset(predictor, data_root, split="val"):
 
         image = Image.open(os.path.join(frame_dir, "rgb.png")).convert("RGB")
         masks = sample["masks"].numpy()
-        class_ids = sample["class_ids"].numpy()
         gt = sample["geodesic_distances"].numpy()
 
         with open(os.path.join(ep_dir, "instruction.txt")) as f:
             instruction = f.read().strip()
 
-        dists, _, _ = predictor.predict_frame(image, masks, class_ids, instruction)
+        dists, _, _ = predictor.predict_frame(image, masks, instruction)  # ← removed class_ids
 
         all_preds.append(dists)
         all_gts.append(gt)
@@ -442,7 +406,6 @@ if __name__ == "__main__":
     # Mode 1: single frame
     p.add_argument("--image", default=None, help="Path to RGB image")
     p.add_argument("--masks", default=None, help="Path to masks.npy [K, H, W]")
-    p.add_argument("--class_ids", default=None, help="Path to class_ids.npy [K]")
     p.add_argument("--instruction", default=None, help="Navigation instruction string")
 
     # Mode 2: episode
@@ -462,15 +425,15 @@ if __name__ == "__main__":
     if a.image and a.masks and a.instruction:
         image = Image.open(a.image).convert("RGB")
         masks = np.load(a.masks)
-        class_ids = np.load(a.class_ids) if a.class_ids else np.zeros(masks.shape[0], dtype=np.int64)
+        # ← removed: class_ids = np.load(a.class_ids) ...
 
-        dists, costmap, attn = predictor.predict_frame(image, masks, class_ids, a.instruction)
+        dists, costmap, attn = predictor.predict_frame(image, masks, a.instruction)  # ← removed class_ids
 
         print(f"\nInstruction: {a.instruction}")
         print(f"Objects: {masks.shape[0]}")
         print(f"\nPredicted geodesic distances (sorted by distance):")
         for k in np.argsort(dists):
-            print(f"  obj_{k:2d} (class {class_ids[k]:3d}): {dists[k]:.4f}")
+            print(f"  obj_{k:2d}: {dists[k]:.4f}")  # ← removed class_ids[k] from print
 
         np.save(os.path.join(a.output, "distances.npy"), dists)
         np.save(os.path.join(a.output, "costmap.npy"), costmap)
