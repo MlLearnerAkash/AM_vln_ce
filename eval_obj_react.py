@@ -199,6 +199,13 @@ if __name__ == "__main__":
     NUM_EPOCHS= 1
     ACCUMULATION_STEPS = 1
     PREPROCESS_GT = False  # Set to True to apply bilateral filtering to GT heatmaps
+
+    # ── Velocity gains ────────────────────────────────────────────────────
+    # Calibrate with: python calibrate_vel_gains.py --mode analytic
+    # Root cause of overshoot: displacement = v * TRANSLATION_GAIN
+    # Optimal value:  TRANSLATION_GAIN = ref_path_step_size / mean(v_gnm)
+    TRANSLATION_GAIN = 10.0   # ← replace with calibrate_vel_gains.py output
+    ROTATION_GAIN    = 20.0    # ← replace with calibrate_vel_gains.py output
     
     config_path = "/data/ws/VLN-CE/models/configs/train.yaml"
     # model = QwenVLHeatmapModel(config_path)
@@ -228,7 +235,17 @@ if __name__ == "__main__":
         config_paths="/data/ws/VLN-CE/vlnce_baselines/config/rxr_baselines/rxr_cma_en.yaml"
     )
     config.defrost()
-    config.TASK_CONFIG.TASK.MEASUREMENTS = ["TOP_DOWN_MAP_VLNCE"]
+    config.TASK_CONFIG.TASK.MEASUREMENTS = [
+        "DISTANCE_TO_GOAL",
+        "SUCCESS",
+        "SPL",
+        "SOFT_SPL",
+        "PATH_LENGTH",
+        "STEPS_TAKEN",
+        "NDTW",
+        "SDTW",
+        "TOP_DOWN_MAP_VLNCE",
+    ]
     config.VIDEO_DIR = "/data/ws/VLN-CE/reference_path_videos"
     config.VIDEO_OPTION = ["disk"]
     config.freeze()
@@ -260,8 +277,10 @@ if __name__ == "__main__":
 
 
 
+    episode_metrics = []  # collect per-episode SDTW/NDTW/SPL
+
     for epoch in range(NUM_EPOCHS):
-        for episode_data in episode_generator(env, num_episodes=2):
+        for episode_data in episode_generator(env, num_episodes=7):
             episode_id = episode_data["episode_id"]
             instruction = episode_data["instruction"]
             frames = episode_data["frames"]
@@ -330,7 +349,12 @@ if __name__ == "__main__":
 
                     v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
                     #NOTE: For object react actions
-                    agent, sim, collided = apply_velocity(vel_control, agent, sim, velocity=v, steer=-w, time_step=0.1)
+                    agent, sim, collided = apply_velocity(
+                        vel_control, agent, sim,
+                        velocity=v, steer=-w, time_step=0.1,
+                        translation_gain=TRANSLATION_GAIN,
+                        rotation_gain=ROTATION_GAIN,
+                    )
                     
                     #Forces the environment to recalculate all metrics based on current simulator state.
                     env._env._task.measurements.update_measures(
@@ -339,30 +363,6 @@ if __name__ == "__main__":
                         task=env._env.task
                     )
                     
-                    # threshold_linear = 0.01
-                    # threshold_angular = 0.1
-                    # abs_w = abs(w)
-                    # if abs_w > threshold_angular:
-                    #     if w > 0:
-                    #         action = {"action": "TURN_LEFT"}
-                    #     else:
-                    #         action = {"action": "TURN_RIGHT"}
-                    # elif v > threshold_linear:
-                    #     action = {"action": "MOVE_FORWARD"}
-                    # else:
-                    #     action = {"action": "STOP"}
-
-                    # logger.info(f"Action: {action['action']} | v={v:.3f}, w={w:.3f}")
-                    # obs, reward, done, info = env.step(action)
-                    # if done:
-                    #     logger.info(f"Episode {episode_id} ended at step {step_count}")
-                    #     break
-                    # #Forces the environment to recalculate all metrics based on current simulator state.
-                    # env._env._task.measurements.update_measures(
-                    #     episode=env._env.current_episode, 
-                    #     action=action,
-                    #     task=env._env.task
-                    # )
                     env._env._update_step_stats()
                     
                     # Get observations and metrics after velocity update
@@ -382,6 +382,31 @@ if __name__ == "__main__":
                     if collided:
                         logger.info(f"Collision detected at step {step_count}")
             
+            # Collect per-episode metrics
+            final_info = env._env.get_metrics()
+            ep_sdtw  = final_info.get("sdtw",  None)
+            ep_ndtw  = final_info.get("ndtw",  None)
+            ep_spl   = final_info.get("spl",   None)
+            ep_softspl = final_info.get("softspl", None)
+            ep_succ  = final_info.get("success", None)
+            ep_dtg   = final_info.get("distance_to_goal", None)
+            episode_metrics.append({
+                "episode_id": episode_id,
+                "sdtw": ep_sdtw,
+                "ndtw": ep_ndtw,
+                "spl":  ep_spl,
+                "softspl": ep_softspl,
+                "success": ep_succ,
+                "distance_to_goal": ep_dtg,
+                "steps": step_count,
+            })
+            logger.info(
+                f"Episode {episode_id} | SDTW={ep_sdtw:.4f} "
+                f"NDTW={ep_ndtw:.4f} SPL={ep_spl:.4f} "
+                f"SoftSPL={ep_softspl:.4f} "
+                f"Success={ep_succ} DTG={ep_dtg:.2f}m steps={step_count}"
+            )
+
             # Generate video for this episode
             if len(video_frames) > 0:
                 generate_video(
@@ -394,5 +419,31 @@ if __name__ == "__main__":
                     tb_writer=None,
                 )
                 logger.info(f"Video saved for episode: {episode_id}, steps: {step_count}")
+
+    # ── Aggregate metrics across all episodes ───────────────────────────────
+    if episode_metrics:
+        def _mean(key):
+            vals = [m[key] for m in episode_metrics if m[key] is not None]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        logger.info("=" * 60)
+        logger.info(f"RESULTS over {len(episode_metrics)} episodes:")
+        logger.info(f"  SDTW    : {_mean('sdtw'):.4f}")
+        logger.info(f"  NDTW    : {_mean('ndtw'):.4f}")
+        logger.info(f"  SPL     : {_mean('spl'):.4f}")
+        logger.info(f"  SoftSPL : {_mean('softspl'):.4f}")
+        logger.info(f"  Success : {_mean('success'):.4f}")
+        logger.info(f"  Avg DTG : {_mean('distance_to_goal'):.2f} m")
+        logger.info(f"  Avg Steps: {_mean('steps'):.1f}")
+        logger.info("=" * 60)
+
+        wandb.log({
+            "eval/sdtw": _mean("sdtw"),
+            "eval/ndtw": _mean("ndtw"),
+            "eval/spl": _mean("spl"),
+            "eval/softspl": _mean("softspl"),
+            "eval/success": _mean("success"),
+            "eval/distance_to_goal": _mean("distance_to_goal"),
+        })
 
     wandb.finish()
