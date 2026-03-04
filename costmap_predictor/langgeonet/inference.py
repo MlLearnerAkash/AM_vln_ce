@@ -120,8 +120,13 @@ class LangGeoNetPredictor:
         attn_map = None
         if attn_weights_all:
             last = attn_weights_all[-1]
-            L_actual = int(attention_mask.sum().item())
-            attn_map = last[0, :K, :L_actual].cpu().numpy()
+            # L_actual = non-padding tokens; skip position 0 (CLIP SOT sink)
+            # and the final EOS token so only content tokens are shown.
+            L_total = int(attention_mask.sum().item())  # includes SOT + content + EOS
+            # content tokens are positions 1 .. L_total-2  (exclude SOT=0 and EOS=L_total-1)
+            content_start = 1
+            content_end   = max(content_start + 1, L_total - 1)  # at least 1 token
+            attn_map = last[0, :K, content_start:content_end].cpu().numpy()  # [K, L_content]
 
         return distances, costmap, attn_map
 
