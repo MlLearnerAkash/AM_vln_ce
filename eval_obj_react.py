@@ -35,6 +35,8 @@ sys.path.append("/data/ws")
 from obj_rec_to_rank_predictor.src.rank_predictor import RankPredictor
 from obj_rec_to_rank_predictor.src.object_react import ObjRelLearntController
 
+from costmap_predictor.langgeonet.inference import LangGeoNetPredictor
+
 def save_norm_frame_heatmap(image, heatmap, save_dir, filename, alpha=0.5):
     """
     Overlay a heatmap (values in [0,255]) on top of an RGB image and save to disk.
@@ -195,6 +197,92 @@ def get_goal_image(image, heatmap, patch_grid=(7, 7), target_size=(120, 160), di
     return costmap, pls_assigned
 
 
+def get_goal_image_langgeonet(
+    image,
+    semantic_map,
+    instruction,
+    predictor,
+    target_size=(120, 160),
+):
+    """
+    Drop-in replacement for get_goal_image that obtains per-object costs via
+    LangGeoNetPredictor instead of a patch heatmap.
+
+    Steps
+    -----
+    1. Resize ``semantic_map`` to ``target_size`` (nearest-neighbour, preserves IDs).
+    2. Build one binary mask per unique object (background ID 0 excluded).
+    3. Run ``predictor.predict_frame`` → per-object normalised geodesic distances [K].
+    4. Sort objects by distance *descending* (highest-cost / farthest first),
+       matching the convention of ``get_goal_image``.
+    5. Return the same (costmap, pls_assigned) shapes:
+         costmap      : np.ndarray  [N, target_h, target_w]  per-object cost channels
+         pls_assigned : np.ndarray  [N,]                     per-object scalar costs
+
+    Args
+    ----
+    image        : np.ndarray [H, W, 3]  RGB frame (uint8 or float)
+    semantic_map : np.ndarray [H, W]     integer instance-segmentation map
+    instruction  : str                   navigation instruction
+    predictor    : LangGeoNetPredictor   pre-loaded predictor instance
+    target_size  : (int, int)            (height, width) of output costmap
+
+    Returns
+    -------
+    costmap      : np.ndarray [N, target_h, target_w]
+    pls_assigned : np.ndarray [N,]
+    """
+    target_h, target_w = target_size
+
+    # ── Step 1: Resize semantic map ──────────────────────────────────────────
+    semantic_resized = cv2.resize(
+        semantic_map.astype(np.float32),
+        (target_w, target_h),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(np.int32)                                      # (target_h, target_w)
+
+    # ── Step 2: Collect unique objects (skip background = 0) ────────────────
+    unique_objects = [int(obj) for obj in np.unique(semantic_resized) if obj != 0]
+    N = len(unique_objects)
+
+    if N == 0:
+        # No objects detected — return empty arrays
+        return np.zeros((0, target_h, target_w), dtype=np.float32), np.array([], dtype=np.float32)
+
+    # Build binary masks  [N, target_h, target_w]
+    masks = np.stack(
+        [(semantic_resized == obj_id).astype(np.float32) for obj_id in unique_objects],
+        axis=0,
+    )                                                       # (N, target_h, target_w)
+
+    # ── Step 3: Run LangGeoNet ───────────────────────────────────────────────
+    # predict_frame expects image as PIL or uint8 ndarray
+    distances, _flat_costmap, _attn = predictor.predict_frame(
+        image, masks, instruction
+    )                                                       # distances: (N,) in [0, 1]
+
+    # Scale to [0, 200] to match the cost range used in get_goal_image
+    costs = (distances * 200.0).astype(np.float32)         # (N,) in [0, 200]
+
+    # ── Step 4: Pair objects with costs and sort descending ──────────────────
+    object_cost_pairs = list(zip(range(N), costs.tolist()))
+    object_cost_pairs.sort(key=lambda x: x[1], reverse=True)
+    # [(local_idx, cost), ...] highest cost first
+
+    # ── Step 5: Build (N, target_h, target_w) costmap ───────────────────────
+    costmap = np.zeros((N, target_h, target_w), dtype=np.float32)
+    sorted_object_costs = []
+
+    for ch_idx, (local_idx, aggregated_cost) in enumerate(object_cost_pairs):
+        obj_mask = masks[local_idx] > 0                     # (target_h, target_w) bool
+        costmap[ch_idx][obj_mask] = aggregated_cost
+        sorted_object_costs.append(aggregated_cost)
+
+    pls_assigned = np.array(sorted_object_costs, dtype=np.float32)  # (N,) descending
+
+    return costmap, pls_assigned
+
+
 if __name__ == "__main__":
     NUM_EPOCHS= 1
     ACCUMULATION_STEPS = 1
@@ -205,7 +293,7 @@ if __name__ == "__main__":
     # Root cause of overshoot: displacement = v * TRANSLATION_GAIN
     # Optimal value:  TRANSLATION_GAIN = ref_path_step_size / mean(v_gnm)
     TRANSLATION_GAIN = 10.0   # ← replace with calibrate_vel_gains.py output
-    ROTATION_GAIN    = 20.0    # ← replace with calibrate_vel_gains.py output
+    ROTATION_GAIN    = 2.0    # ← replace with calibrate_vel_gains.py output
     
     config_path = "/data/ws/VLN-CE/models/configs/train.yaml"
     # model = QwenVLHeatmapModel(config_path)
@@ -222,6 +310,7 @@ if __name__ == "__main__":
     object_react_config= "/data/ws/obj_rec_to_rank_predictor/configs/object_react.yaml"
     object_react_controller= ObjRelLearntController(object_react_config, dirname_vis_episode= "/data/dataset/RXR/dataset/rxr/test")
 
+    langgeonet = LangGeoNetPredictor("/data/ws/VLN-CE/costmap_predictor/langgeonet/checkpoints/best_model.pt")
 
     logging.basicConfig(
     # filename="train.log",
@@ -280,7 +369,7 @@ if __name__ == "__main__":
     episode_metrics = []  # collect per-episode SDTW/NDTW/SPL
 
     for epoch in range(NUM_EPOCHS):
-        for episode_data in episode_generator(env, num_episodes=7):
+        for episode_data in episode_generator(env, num_episodes=1):
             episode_id = episode_data["episode_id"]
             instruction = episode_data["instruction"]
             frames = episode_data["frames"]
@@ -345,7 +434,8 @@ if __name__ == "__main__":
 
                     # Forward pass for a single image
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
-                    mask, pls= get_goal_image(frame, gt_heatmap) #pred_heatmap
+                    mask, pls = get_goal_image_langgeonet(frame, semantic_map, instruction, langgeonet)
+                    # mask, pls= get_goal_image(frame, gt_heatmap) #pred_heatmap
 
                     v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
                     #NOTE: For object react actions

@@ -128,6 +128,11 @@ def drawline(
         y = int((pt1[1] * (1 - r) + pt2[1] * r) + 0.5)
         pts.append((x, y))
 
+    if not pts:
+        # pt1 and pt2 are closer than one gap — draw a solid segment and return
+        cv2.line(img, pt1, pt2, color, thickness)
+        return
+
     if style == "dotted":
         for p in pts:
             cv2.circle(img, p, thickness, color, -1)

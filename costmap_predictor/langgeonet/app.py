@@ -14,6 +14,8 @@ import sys
 import argparse
 import io
 
+from typing import Optional
+
 import numpy as np
 from PIL import Image
 import matplotlib
@@ -40,6 +42,38 @@ def load_masks(masks_path: str) -> np.ndarray:
     valid = masks.any(axis=(1, 2))       # remove all-zero masks
     masks = masks[valid]
     return masks
+
+
+def load_gt_distances(masks_path: str) -> Optional[np.ndarray]:
+    """
+    Look for ``geodesic_distances.npy`` in the same directory as *masks_path*
+    and return a [K_valid] float array aligned to the non-empty masks.
+
+    The GT file is expected to hold one distance value per mask entry [K_all].
+    Empty-mask rows are dropped with the same boolean filter used in
+    :func:`load_masks` so the result aligns with the filtered masks array.
+
+    Returns ``None`` when the file does not exist.
+    """
+    gt_path = os.path.join(os.path.dirname(os.path.abspath(masks_path)),
+                           "geodesic_distances.npy")
+    if not os.path.isfile(gt_path):
+        return None
+
+    # Re-load the *unfiltered* masks to reproduce the same valid boolean mask
+    raw_masks = np.load(masks_path)              # [K_all, H, W]
+    valid     = raw_masks.any(axis=(1, 2))       # [K_all] bool
+
+    gt_all = np.load(gt_path).astype(np.float32)  # [K_all] or [K_valid]
+    if gt_all.shape[0] == valid.sum():
+        # Already filtered (K_valid entries)
+        return gt_all
+    if gt_all.shape[0] == raw_masks.shape[0]:
+        # Full array — apply the same valid filter
+        return gt_all[valid]
+
+    # Unexpected shape — return as-is and let the caller decide
+    return gt_all
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +186,121 @@ def render_per_object_figure(
     return np.array(Image.open(buf).convert("RGB"))
 
 
+def render_gt_diff_figure(
+    image_np: np.ndarray,
+    masks: np.ndarray,
+    pred_distances: np.ndarray,
+    gt_distances: np.ndarray,
+) -> np.ndarray:
+    """
+    Four-panel figure comparing GT and predicted geodesic distances.
+
+    Panels
+    ------
+    1. GT costmap               – masks painted with GT geodesic distances
+    2. Predicted costmap        – same colour scale as GT
+    3. |pred − GT| costmap      – absolute error per pixel (hot colourmap)
+    4. Abs-error overlay        – absolute error heatmap blended onto the
+                                  input image so the changing regions are
+                                  spatially visible; per-object abs-error
+                                  bar chart inset via a second sub-figure row
+    """
+    K, H, W = masks.shape
+
+    # Build per-pixel costmaps (background = NaN → renders as white/transparent)
+    gt_map   = np.full((H, W), np.nan, dtype=np.float32)
+    pred_map = np.full((H, W), np.nan, dtype=np.float32)
+    abs_map  = np.full((H, W), np.nan, dtype=np.float32)
+    for k in range(K):
+        px = masks[k] > 0
+        gt_map[px]   = gt_distances[k]
+        pred_map[px] = pred_distances[k]
+        abs_map[px]  = abs(pred_distances[k] - gt_distances[k])
+
+    # Shared colour scale for GT / pred panels
+    all_vals = np.concatenate([gt_distances, pred_distances])
+    vmin_shared, vmax_shared = float(all_vals.min()), float(all_vals.max())
+
+    # Absolute error scale (0 → max)
+    abs_vals = np.abs(pred_distances - gt_distances)
+    abs_max  = max(float(abs_vals.max()), 1e-6)
+
+    # --- Abs-error overlay on the input image ---
+    # Normalise abs_map to [0,1], colourise, blend with image
+    abs_map_norm = np.where(np.isnan(abs_map), 0.0, abs_map / abs_max)  # [H,W]
+    hot_cmap  = cm.get_cmap("hot")
+    abs_color = hot_cmap(abs_map_norm)[:, :, :3]                        # [H,W,3]
+    base      = image_np.astype(np.float32) / 255.0
+    # Only colour pixels that belong to at least one mask
+    any_mask = (~np.isnan(abs_map))
+    overlay  = base.copy()
+    overlay[any_mask] = (0.45 * base[any_mask] +
+                         0.55 * abs_color[any_mask])
+
+    mae = float(abs_vals.mean())
+
+    fig = plt.figure(figsize=(26, 12))
+    # Top row: 4 image panels
+    ax0 = fig.add_subplot(2, 4, 1)
+    ax1 = fig.add_subplot(2, 4, 2)
+    ax2 = fig.add_subplot(2, 4, 3)
+    ax3 = fig.add_subplot(2, 4, 4)
+    # Bottom row: per-object bar chart spanning all columns
+    ax4 = fig.add_subplot(2, 1, 2)
+
+    fig.suptitle(f"GT vs Predicted — MAE = {mae:.4f}", fontsize=13)
+
+    # --- Panel 1: GT costmap ---
+    im0 = ax0.imshow(gt_map, cmap="RdYlGn_r",
+                     vmin=vmin_shared, vmax=vmax_shared)
+    ax0.set_title("GT Geodesic Distances")
+    ax0.axis("off")
+    plt.colorbar(im0, ax=ax0, fraction=0.046, label="Distance")
+
+    # --- Panel 2: Predicted costmap ---
+    im1 = ax1.imshow(pred_map, cmap="RdYlGn_r",
+                     vmin=vmin_shared, vmax=vmax_shared)
+    ax1.set_title("Predicted Geodesic Distances")
+    ax1.axis("off")
+    plt.colorbar(im1, ax=ax1, fraction=0.046, label="Distance")
+
+    # --- Panel 3: Absolute difference |pred − GT| ---
+    im2 = ax2.imshow(abs_map, cmap="hot", vmin=0, vmax=abs_max)
+    ax2.set_title("|pred − GT|  Absolute Error")
+    ax2.axis("off")
+    plt.colorbar(im2, ax=ax2, fraction=0.046, label="|Δ Distance|")
+
+    # --- Panel 4: Overlay – changing regions on image ---
+    ax3.imshow(np.clip(overlay, 0, 1))
+    ax3.set_title("Changing Regions  (hot = higher error)")
+    ax3.axis("off")
+
+    # --- Bottom: per-object absolute error bar chart ---
+    labels  = [f"obj_{k}" for k in range(K)]
+    order   = np.argsort(abs_vals)[::-1]          # largest error first
+    bar_colors = cm.get_cmap("hot")(
+        abs_vals[order] / abs_max * 0.85 + 0.05   # avoid pitch-black bars
+    )
+    ax4.bar(range(K), abs_vals[order], color=bar_colors)
+    ax4.set_xticks(range(K))
+    ax4.set_xticklabels([labels[i] for i in order], rotation=45, ha="right",
+                         fontsize=max(5, 9 - K // 10))
+    ax4.set_ylabel("|pred − GT|")
+    ax4.set_title("Per-Object Absolute Error  (sorted, largest first)")
+    # Annotate each bar with its raw GT / pred values
+    for rank, k in enumerate(order):
+        ax4.text(rank, abs_vals[k] + abs_max * 0.01,
+                 f"GT={gt_distances[k]:.2f}\nP={pred_distances[k]:.2f}",
+                 ha="center", va="bottom", fontsize=max(5, 7 - K // 15))
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return np.array(Image.open(buf).convert("RGB"))
+
+
 def render_attention_figure(
     instruction: str,
     attn_weights: np.ndarray,
@@ -224,24 +373,24 @@ def run_inference(
     device: str,
 ):
     if image_pil is None:
-        return None, None, None, "Please upload an image."
+        return None, None, None, None, "Please upload an image."
     if not masks_path or not masks_path.strip():
-        return None, None, None, "Please enter the path to a masks .npy file ([K, H, W])."
+        return None, None, None, None, "Please enter the path to a masks .npy file ([K, H, W])."
     if not instruction or not instruction.strip():
-        return None, None, None, "Please enter a navigation instruction."
+        return None, None, None, None, "Please enter a navigation instruction."
 
     masks_path = masks_path.strip()
     if not os.path.isfile(masks_path):
-        return None, None, None, f"Masks file not found: {masks_path}"
+        return None, None, None, None, f"Masks file not found: {masks_path}"
 
     # Load masks from the .npy file — same as inference.py CLI
     try:
         masks = load_masks(masks_path)   # [K_valid, H, W]
     except Exception as e:
-        return None, None, None, f"Failed to load masks: {e}"
+        return None, None, None, None, f"Failed to load masks: {e}"
 
     if masks.shape[0] == 0:
-        return None, None, None, "All masks are empty after filtering."
+        return None, None, None, None, "All masks are empty after filtering."
 
     predictor = get_predictor(checkpoint_path, device)
     image_np = np.array(image_pil.convert("RGB"))
@@ -250,17 +399,35 @@ def run_inference(
     distances, costmap, attn = predictor.predict_frame(image_pil, masks, instruction)
 
     if len(distances) == 0:
-        return None, None, None, "No valid objects detected in the image."
+        return None, None, None, None, "No valid objects detected in the image."
 
     costmap_fig = render_costmap_figure(image_np, costmap, instruction, len(distances))
     per_obj_fig = render_per_object_figure(image_np, masks, distances)
-    attn_fig = render_attention_figure(instruction, attn, len(distances)) if attn is not None else None
+    attn_fig    = render_attention_figure(instruction, attn, len(distances)) if attn is not None else None
+
+    # --- GT difference figure (optional) ---
+    gt_diff_fig = None
+    gt_distances = load_gt_distances(masks_path)
+    if gt_distances is not None:
+        if len(gt_distances) == len(distances):
+            gt_diff_fig = render_gt_diff_figure(image_np, masks, distances, gt_distances)
+        else:
+            print(
+                f"[app] GT distances length {len(gt_distances)} != "
+                f"predicted {len(distances)} — skipping diff panel."
+            )
 
     status = (
         f"Done.  {len(distances)} objects | "
         f"min dist={distances.min():.4f}  max dist={distances.max():.4f}"
     )
-    return costmap_fig, per_obj_fig, attn_fig, status
+    if gt_distances is not None and gt_diff_fig is not None:
+        mae = float(np.abs(distances - gt_distances).mean())
+        status += f"  |  MAE vs GT={mae:.4f}"
+    elif gt_distances is None:
+        status += "  |  geodesic_distances.npy not found (no GT diff)"
+
+    return costmap_fig, per_obj_fig, attn_fig, gt_diff_fig, status
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +476,10 @@ def build_app(checkpoint_path: str, device: str = None, share: bool = False):
                 status_box = gr.Textbox(label="Status", interactive=False, lines=1)
 
             with gr.Column(scale=2):
+                gt_diff_out = gr.Image(
+                    label="GT vs Predicted Distances  (geodesic_distances.npy)",
+                    type="numpy",
+                )
                 costmap_out = gr.Image(
                     label="Costmap Visualization",
                     type="numpy",
@@ -321,11 +492,12 @@ def build_app(checkpoint_path: str, device: str = None, share: bool = False):
                     label="Cross-Attention Map",
                     type="numpy",
                 )
+                
 
         run_btn.click(
             fn=lambda img, masks, txt: run_inference(img, masks, txt, checkpoint_path, device),
             inputs=[image_input, masks_input, instruction_input],
-            outputs=[costmap_out, per_obj_out, attn_out, status_box],
+            outputs=[costmap_out, per_obj_out, attn_out, gt_diff_out, status_box],
             api_name=False,
         )
 

@@ -268,10 +268,17 @@ class LangGeoNet(nn.Module):
         # ========== Instruction Pooling ==========
         self.instruction_pool_attn = nn.Linear(d_model, 1)
 
+        # ========== Per-object instruction alignment projection ==========
+        # Projects the global instruction vector to the same space as x so
+        # the dot-product alignment score is meaningful and learnable.
+        self.instr_align_proj = nn.Linear(d_model, d_model)
+
         # ========== Geodesic Distance Prediction Head ==========
-        # Input: object feature (d_model) + global instruction (d_model)
+        # Input: object feature (d_model) + per-object alignment scalar (1)
+        # The alignment scalar is explicitly different per object and encodes
+        # how much each object's post-attention feature aligns with the instruction.
         self.geo_head = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
+            nn.Linear(d_model + 1, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
             nn.Dropout(dropout),
@@ -362,9 +369,18 @@ class LangGeoNet(nn.Module):
             attn_weights_all.append(attn_w)
 
         # --- Predict geodesic per object ---
-        instr_expanded = instr_vec.unsqueeze(1).expand(-1, K_max, -1)
-        head_input = torch.cat([x, instr_expanded], dim=-1)  # [B, K_max, 2d]
-        geo_pred = self.geo_head(head_input).squeeze(-1)      # [B, K_max]
+        # x contains language conditioning from cross-attention, but the language
+        # delta is approximately equal for all K objects (flat attention).
+        # We add an explicit per-object alignment score: the scaled dot product
+        # between each object's post-transformer feature and the global instruction
+        # vector. This is different for each object and gives the head an
+        # unambiguous instruction-discriminative signal.
+        instr_proj = self.instr_align_proj(instr_vec)               # [B, d]
+        align = torch.bmm(
+            x, instr_proj.unsqueeze(-1)                             # [B, K, d] x [B, d, 1]
+        ).squeeze(-1) / (self.d_model ** 0.5)                       # [B, K] — different per object
+        head_input = torch.cat([x, align.unsqueeze(-1)], dim=-1)    # [B, K, d+1]
+        geo_pred = self.geo_head(head_input).squeeze(-1)             # [B, K_max]
 
         # --- Unpad ---
         predictions = []

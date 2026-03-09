@@ -20,10 +20,8 @@ from models.unet_clip import CLIPUNet2D
 from dataset.episode_generator import episode_generator
 from vlnce_baselines.config.default import get_config
 from dataset.episode_dataset import EpisodeDataset, collate_fn
-from losses.loss import combined_navigation_loss
-
-sys.path.append("/data/ws")
-from obj_rec_to_rank_predictor.src.rank_predictor import RankPredictor
+from losses.loss import geodesic_distance_loss
+from vlnce_baselines.common.environments import VLNCEDaggerEnv
 
 def save_numpy_images_to_temp(frames, norm_frames, temp_dir):
     frames_dir = os.path.join(temp_dir, "frames")
@@ -89,7 +87,8 @@ if __name__ == "__main__":
     
     config_path = "/data/ws/VLN-CE/models/configs/train.yaml"
     # model = QwenVLHeatmapModel(config_path)
-    model = CLIPUNet2D(in_channels=3, out_channels=1, fChannel=64).to("cuda" if torch.cuda.is_available() else "cpu")
+    # in_channels=4: 3 RGB + 1 normalised semantic-ID channel
+    model = CLIPUNet2D(in_channels=4, out_channels=1, fChannel=64).to("cuda" if torch.cuda.is_available() else "cpu")
     total_params, trainable_params = count_parameters(model)
     print(f"Total parameters in decoder: {total_params}")
     print(f"Trainable parameters in decoder: {trainable_params}")
@@ -137,12 +136,17 @@ if __name__ == "__main__":
         T_max=NUM_EPOCHS,
         eta_min=1e-6
     )
+    env = VLNCEDaggerEnv(config=config)
+    sim= env._env.sim
+    agent = env._env.sim.get_agent(0)
+
     for epoch in range(NUM_EPOCHS):
-        for episode_data in episode_generator(config, num_episodes=2):
-            episode_id = episode_data["episode_id"]
-            instruction = episode_data["instruction"]
-            frames = episode_data["frames"]
-            norm_frames = episode_data["norm_frames"]
+        for episode_data in episode_generator(env, num_episodes=2):
+            episode_id       = episode_data["episode_id"]
+            instruction      = episode_data["instruction"]
+            frames           = episode_data["frames"]
+            norm_frames      = episode_data["norm_frames"]
+            semantic_frames  = episode_data.get("semantic_frames", [None] * len(frames))
 
             if len(frames) != len(norm_frames):
                 print(f"Skipping episode {episode_id}: image and heatmap sequence lengths do not match.")
@@ -152,37 +156,55 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             with tempfile.TemporaryDirectory(prefix=f"episode_{episode_id}_") as temp_dir:
                 frame_paths, norm_frame_paths = save_numpy_images_to_temp(frames, norm_frames, temp_dir)
-                frames = [np.array(Image.open(p)) for p in frame_paths]
-                heatmaps = [np.array(Image.open(p)) for p in norm_frame_paths]
+                frames_loaded   = [np.array(Image.open(p)) for p in frame_paths]
+                heatmaps_loaded = [np.array(Image.open(p)) for p in norm_frame_paths]
+                # Semantic frames kept as numpy int arrays (no temp-file round-trip needed)
+                sem_loaded = [
+                    sf.astype(np.int32) if sf is not None else np.zeros(frames_loaded[i].shape[:2], dtype=np.int32)
+                    for i, sf in enumerate(semantic_frames)
+                ]
                 instruction = episode_data["instruction"]
 
-                dataset = EpisodeDataset(frames, heatmaps, instruction)
+                dataset = EpisodeDataset(frames_loaded, heatmaps_loaded, instruction,
+                                         semantic_maps=sem_loaded)
                 dataloader = DataLoader(dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
 
-                for batch_frames, batch_heatmaps, batch_instruction in dataloader:
-                    batch_frames = batch_frames.to("cuda" if torch.cuda.is_available() else "cpu")
-                    batch_heatmaps = batch_heatmaps.to("cuda" if torch.cuda.is_available() else "cpu")
-                    
+                for batch_frames, batch_heatmaps, batch_sem_norms, batch_sem_ids, batch_instruction in dataloader:
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    batch_frames    = batch_frames.to(device)     # (B, 3, H, W)
+                    batch_heatmaps  = batch_heatmaps.to(device)   # (B, 1, H, W)
+                    batch_sem_norms = batch_sem_norms.to(device)  # (B, 1, H, W) normalised [0,1]
+                    batch_sem_ids   = batch_sem_ids.to(device)    # (B, 1, H, W) raw int IDs
+
+                    # Build 4-channel model input: [RGB | semantic_norm]
+                    model_input = torch.cat([batch_frames, batch_sem_norms], dim=1)  # (B, 4, H, W)
+
                     # Forward pass
-                    pred_heatmap = model(batch_frames, batch_instruction)
-                    
-                    # Resize target if needed
+                    pred_heatmap = model(model_input, batch_instruction)
+
+                    # Resize target if resolution mismatch
                     if pred_heatmap.shape[-2:] != batch_heatmaps.shape[-2:]:
                         batch_heatmaps = F.interpolate(
-                            batch_heatmaps, 
-                            size=pred_heatmap.shape[-2:], 
-                            mode='bilinear', 
+                            batch_heatmaps,
+                            size=pred_heatmap.shape[-2:],
+                            mode='bilinear',
                             align_corners=True
                         )
+                        batch_sem_ids = F.interpolate(
+                            batch_sem_ids.float(),
+                            size=pred_heatmap.shape[-2:],
+                            mode='nearest'
+                        ).long()
 
-                    # Compute loss with new loss function
-                    total_loss, cost_loss, dir_loss = combined_navigation_loss(
-                                                                                pred_heatmap, 
-                                                                                batch_heatmaps,
-                                                                                occupancy_mask=None,
-                                                                                cost_weight=1.0,
-                                                                                dir_weight=0.5  # Adjust this to control smoothness
-                                                                            )
+                    # Geodesic distance loss: BerHu (foreground-masked) + ordinal ranking
+                    total_loss, berhu_l, ordinal_l = geodesic_distance_loss(
+                        pred_heatmap,
+                        batch_heatmaps,
+                        semantic_map=batch_sem_ids,
+                        background_id=0,
+                        berhu_weight=1.0,
+                        ordinal_weight=0.3,
+                    )
 
                     epoch_loss.append(total_loss)
 
@@ -204,24 +226,23 @@ if __name__ == "__main__":
                         # Logging
                         logger.info(
                             f"Episode {episode_id} | Step {step_count} | "
-                            f"Total Loss: {total_loss}| cost_loss: {cost_loss}| dir_loss: {dir_loss}"
-
+                            f"Total Loss: {total_loss.item():.6f} | "
+                            f"BerHu: {berhu_l.item():.6f} | Ordinal: {ordinal_l.item():.6f}"
                         )
-                        
-                        batch_frames_np = batch_frames.detach().cpu().numpy()
-                        batch_heatmaps_np = batch_heatmaps.detach().cpu().numpy()
-                        pred_heatmaps_np = pred_heatmap.detach().cpu().numpy()
 
-                        # Enhanced logging with loss components
+                        batch_frames_np    = batch_frames.detach().cpu().numpy()
+                        batch_heatmaps_np  = batch_heatmaps.detach().cpu().numpy()
+                        pred_heatmaps_np   = pred_heatmap.detach().cpu().numpy()
+
                         log_dict = {
-                            "episode_id": episode_id,
-                            "timestep": step_count,
-                            "learning_rate": optimizer.param_groups[0]['lr'],
-                            "total_loss": total_loss,
-                            "cost_loss": cost_loss,
-                            "dir_loss": dir_loss,
-                            "gt_heatmap_batch": [wandb.Image(h.squeeze()*255) for h in batch_heatmaps_np[:4]],
-                            "pred_heatmap_batch": [wandb.Image(h.squeeze()*255) for h in pred_heatmaps_np[:4]],
+                            "episode_id":        episode_id,
+                            "timestep":          step_count,
+                            "learning_rate":     optimizer.param_groups[0]['lr'],
+                            "total_loss":        total_loss.item(),
+                            "berhu_loss":        berhu_l.item(),
+                            "ordinal_loss":      ordinal_l.item(),
+                            "gt_heatmap_batch":  [wandb.Image(h.squeeze() * 255) for h in batch_heatmaps_np[:4]],
+                            "pred_heatmap_batch":[wandb.Image(h.squeeze() * 255) for h in pred_heatmaps_np[:4]],
                         }
                         wandb.log(log_dict)
                     
