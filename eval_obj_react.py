@@ -4,6 +4,8 @@ import time
 import logging
 import wandb
 
+
+
 import tempfile
 import os
 from PIL import Image
@@ -30,6 +32,16 @@ from utils.obj_react_velo_to_action import apply_velocity
 from vlnce_baselines.common.environments import VLNCEDaggerEnv
 from habitat_extensions.utils import generate_video, observations_to_image
 from habitat.utils.visualizations.utils import append_text_to_image
+
+
+# #Discrete object react
+# from controller.object_react.train.inference import load_config, build_model, load_checkpoint
+# from controller.object_react.train.inference import predict_from_image_masks_costs
+# object_rec_dis_config = load_config("/data/ws/VLN-CE/controller/object_react/train/config/object_react_vln.yaml")
+# object_rec_dis_model  = build_model(object_rec_dis_config)
+# object_rec_dis_model  = load_checkpoint(object_rec_dis_model, "/data/ws/VLN-CE/controller/object_react/train/logs/object_react_vln/object_react_vln_2026_03_09_08_12_04_/latest.pth", "gnm")
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# object_rec_dis_model  = object_rec_dis_model.to(device).eval()
 
 sys.path.append("/data/ws")
 from obj_rec_to_rank_predictor.src.rank_predictor import RankPredictor
@@ -282,11 +294,94 @@ def get_goal_image_langgeonet(
 
     return costmap, pls_assigned
 
+#from waypoints to discrete actions
+def decide_action(waypoints,
+                  turn_thresh_deg=15.0,
+                  stop_thresh=0.1):
+    
+    waypoints = np.array(waypoints)
+    waypoints= waypoints[:10] #taking first 3 future points
+    dists = waypoints[:, 0]  
+
+    if dists[0] < stop_thresh:
+        return "STOP", 0.0
+
+    col1 = waypoints[:, 1]
+    slope = np.polyfit(waypoints[:, 0], col1, 1)[0]
+
+    mid_idx = len(waypoints) // 4
+    lateral = col1[mid_idx]
+    angle_deg = np.degrees(np.arctan2(abs(lateral), waypoints[mid_idx, 0]))
+
+    if abs(slope) < np.tan(np.radians(turn_thresh_deg)):
+        action = "MOVE_FORWARD"
+    elif slope > 0:
+        action = "TURN_LEFT"   
+    else:
+        action = "TURN_RIGHT"  
+
+    return action, slope
+
+#move agents by waypoints
+import habitat_sim
+from habitat_sim.utils.common import quat_to_magnum, quat_from_magnum
+
+def move_agent_by_waypoint(wp, agent, sim, time_step=0.1):
+    """
+    Move agent to the first waypoint in the local (dx, dy) frame.
+    wp: np.ndarray [N, 2], wp[i] = (cumulative_forward, cumulative_lateral)
+    """
+    dx = float(wp[0, 0])   # forward displacement in agent frame
+    dy = float(wp[0, 1])   # lateral displacement (+left in GNM)
+
+    state = agent.state
+
+    # Build local-frame axis vectors from current rotation
+    forward_vec = habitat_sim.utils.quat_rotate_vector(
+        state.rotation, np.array([0, 0, -1.0])   # Habitat: forward = -Z local
+    )
+    left_vec = habitat_sim.utils.quat_rotate_vector(
+        state.rotation, np.array([-1.0, 0, 0])   # Habitat: left = -X local
+    )
+
+    # Compute target world position
+    target_pos = state.position + forward_vec * dx + left_vec * dy
+
+    # Optionally update heading to face the waypoint direction
+    yaw = np.arctan2(dy, dx)   # heading correction in radians
+    delta_rot = habitat_sim.utils.quat_from_angle_axis(yaw, np.array([0, 1.0, 0]))
+    new_rotation = delta_rot * state.rotation
+
+    # Snap to navmesh to avoid walking through walls
+    end_pos = sim.step_filter(state.position, target_pos)
+
+    state.position = end_pos
+    state.rotation = quat_from_magnum(
+        quat_to_magnum(new_rotation)
+    )
+    agent.set_state(state)
+
+    sim.step_physics(dt=time_step)
+    return agent, sim
 
 if __name__ == "__main__":
     NUM_EPOCHS= 1
     ACCUMULATION_STEPS = 1
     PREPROCESS_GT = False  # Set to True to apply bilateral filtering to GT heatmaps
+
+    # ── Action mode ───────────────────────────────────────────────────────
+    # True  → use env.step() with discrete actions (MOVE_FORWARD / TURN_LEFT /
+    #          TURN_RIGHT / STOP) derived from decide_action().
+    # False → use apply_velocity() with continuous velocity control.
+    USE_DISCRETE_ACTIONS = False
+
+    # Discrete-action map: decide_action() labels → Habitat action names
+    DISCRETE_ACTION_MAP = {
+        "MOVE_FORWARD": "MOVE_FORWARD",
+        "TURN_LEFT":    "TURN_LEFT",
+        "TURN_RIGHT":   "TURN_RIGHT",
+        "STOP":         "STOP",
+    }
 
     # ── Velocity gains ────────────────────────────────────────────────────
     # Calibrate with: python calibrate_vel_gains.py --mode analytic
@@ -431,33 +526,72 @@ if __name__ == "__main__":
                     # obs = sim.get_sensor_observations()
                     # frame= np.array(obs["rgb"])
                     # semantic_map = obs["semantic"].astype(np.int32)
+                    
+
 
                     # Forward pass for a single image
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
                     mask, pls = get_goal_image_langgeonet(frame, semantic_map, instruction, langgeonet)
                     # mask, pls= get_goal_image(frame, gt_heatmap) #pred_heatmap
 
-                    v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
-                    #NOTE: For object react actions
-                    agent, sim, collided = apply_velocity(
-                        vel_control, agent, sim,
-                        velocity=v, steer=-w, time_step=0.1,
-                        translation_gain=TRANSLATION_GAIN,
-                        rotation_gain=ROTATION_GAIN,
-                    )
-                    
-                    #Forces the environment to recalculate all metrics based on current simulator state.
-                    env._env._task.measurements.update_measures(
-                        episode=env._env.current_episode, 
-                        action={"action": "VELOCITY_CONTROL"},  # Dummy action
-                        task=env._env.task
-                    )
-                    
-                    env._env._update_step_stats()
-                    
-                    # Get observations and metrics after velocity update
-                    obs = sim.get_sensor_observations()
-                    info = env._env.get_metrics()
+                    wp, v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
+
+                    action, angle_deg= decide_action(wp)
+
+                    if USE_DISCRETE_ACTIONS:
+                        # ── Discrete action branch ──────────────────────────
+                        # Guard: don't step into an already-finished episode
+                        if env._env.episode_over:
+                            break
+                        habitat_action = DISCRETE_ACTION_MAP.get(action, "MOVE_FORWARD")
+                        step_result = env.step({"action": habitat_action})
+                        # VLNCEDaggerEnv.step() returns (obs, done) or just obs
+                        if isinstance(step_result, tuple):
+                            obs, _, done, info = step_result
+                        else:
+                            obs = step_result
+                        sim = env._env.sim
+                        agent = env._env.sim.get_agent(0)
+                        info = env._env.get_metrics()
+                        collided = False
+                        # STOP or episode finished — exit the frame loop
+                        if habitat_action == "STOP" or env._env.episode_over:
+                            break
+                    else:
+                        # ── Velocity control branch ─────────────────────────
+                        # agent, sim, collided = apply_velocity(
+                        #     vel_control, agent, sim,
+                        #     velocity=v, steer=-w, time_step=0.1,
+                        #     translation_gain=TRANSLATION_GAIN,
+                        #     rotation_gain=ROTATION_GAIN,
+                        # )
+
+                        # #Forces the environment to recalculate all metrics based on current simulator state.
+                        # env._env._task.measurements.update_measures(
+                        #     episode=env._env.current_episode,
+                        #     action={"action": "VELOCITY_CONTROL"},  # Dummy action
+                        #     task=env._env.task
+                        # )
+
+                        # env._env._update_step_stats()
+
+                        # # Get observations and metrics after velocity update
+                        # obs = sim.get_sensor_observations()
+                        # info = env._env.get_metrics()
+                        if np.linalg.norm(wp[0]) < 0.05:
+                            break  # reached goal
+
+                        agent, sim = move_agent_by_waypoint(wp, agent, sim)
+
+                        # Update env metrics
+                        env._env._task.measurements.update_measures(
+                            episode=env._env.current_episode,
+                            action={"action": "VELOCITY_CONTROL"},
+                            task=env._env.task
+                        )
+                        env._env._update_step_stats()
+                        obs = sim.get_sensor_observations()
+                        info = env._env.get_metrics()
                     
                     #Adding Vis_img
                     obs['vis_img'] = vis_img
@@ -469,8 +603,8 @@ if __name__ == "__main__":
                     step_count += 1
                     
                     # Log collision
-                    if collided:
-                        logger.info(f"Collision detected at step {step_count}")
+                    # if collided:
+                    #     logger.info(f"Collision detected at step {step_count}")
             
             # Collect per-episode metrics
             final_info = env._env.get_metrics()

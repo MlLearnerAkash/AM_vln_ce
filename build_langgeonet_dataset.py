@@ -60,6 +60,7 @@ from PIL import Image
 from costmap_predictor.langgeonet.inference import LangGeoNetPredictor
 from dataset.episode_generator import episode_generator
 from habitat_extensions.shortest_path_follower import ShortestPathFollowerCompat
+from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances
 from vlnce_baselines.common.environments import VLNCEDaggerEnv
 from vlnce_baselines.config.default import get_config
 
@@ -69,16 +70,10 @@ from vlnce_baselines.config.default import get_config
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _quat_to_yaw(rotation) -> float:
-    """
-    Extract yaw (rotation around vertical Y axis) from a Habitat quaternion.
-
-    Habitat-Sim stores agent rotations as numpy-quaternion objects
-    (from the 'quaternion' package) with attributes .w, .x, .y, .z.
-
-    A pure yaw θ around Y gives  q = (cos θ/2, 0, sin θ/2, 0)
-    so  θ = 2 * atan2(q.y, q.w).
-    """
-    return 2.0 * math.atan2(float(rotation.y), float(rotation.w))
+    theta_habitat = 2.0 * math.atan2(float(rotation.y), float(rotation.w))
+    # Habitat Y-rotation → standard math yaw (forward = [cos φ, sin φ])
+    # In Habitat (x,z): forward = [-sin θ, -cos θ], so φ = -(θ + π/2)
+    return -(theta_habitat + math.pi / 2)
 
 
 def _position_to_xy(position) -> np.ndarray:
@@ -89,6 +84,30 @@ def _position_to_xy(position) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 # Mask builder
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _gt_costs_from_distances(
+    object_ids: list,
+    distances_dict: dict,
+    cost_scale: float,
+) -> np.ndarray:
+    """
+    Convert a {object_id: geodesic_distance} dict to a per-object cost array
+    that matches the ordering of *object_ids* (as returned by
+    ``_masks_from_semantic``).
+
+    Distances that are ``None`` or ``inf`` are clamped to 55 m (same cap used
+    in ``get_object_geodesic_distances``).  The values are then normalised
+    per-frame to [0, 1] and scaled by *cost_scale* so that they are on the
+    same range as the LangGeoNet outputs.
+    """
+    raw = np.array(
+        [float(distances_dict.get(oid) or 55.0) for oid in object_ids],
+        dtype=np.float64,
+    )
+    mn, mx = raw.min(), raw.max()
+    norm = (raw - mn) / (mx - mn) if mx > mn else np.zeros_like(raw)
+    return (norm * cost_scale).astype(np.float64)
+
 
 def _masks_from_semantic(semantic: np.ndarray):
     """
@@ -232,20 +251,27 @@ class DatasetBuilder:
 
 def collect_and_save(
     env,
-    predictor: LangGeoNetPredictor,
     builder: DatasetBuilder,
     num_episodes: int,
-    image_size: tuple,          # (H, W) output resolution
-    cost_scale: float = 200.0,  # map [0,1] distance → [0, cost_scale]
+    image_size: tuple,                      # (H, W) output resolution
+    cost_scale: float = 100.0,              # map [0,1] distance → [0, cost_scale]
+    predictor: "LangGeoNetPredictor | None" = None,
+    use_gt_geodesic: bool = False,
 ):
     """
-    Follow the reference path for each episode, run LangGeoNet per frame,
-    and write the dataset.
+    Follow the reference path for each episode, run LangGeoNet (or use GT
+    geodesic distances) per frame, and write the dataset.
+
+    Exactly one of *predictor* or *use_gt_geodesic=True* must be provided.
 
     Returns
     -------
     traj_names : list[str]  names of all saved trajectories, in order
     """
+    if use_gt_geodesic and predictor is not None:
+        raise ValueError("Specify either --use_gt_geodesic or a LangGeoNet checkpoint, not both.")
+    if not use_gt_geodesic and predictor is None:
+        raise ValueError("Provide a LangGeoNet checkpoint via --langgeonet_ckpt, or pass --use_gt_geodesic.")
     follower = ShortestPathFollowerCompat(
         env._env.sim, goal_radius=0.5, return_one_hot=False
     )
@@ -264,7 +290,6 @@ def collect_and_save(
             traj_name      = f"ep_{episode_id}"
 
             images, positions, yaws, actions, masks_list, costs_list = [], [], [], [], [], []
-
             # ── Walk the reference path ──────────────────────────────────────
             for waypoint in reference_path:
                 while not env._env.episode_over:
@@ -288,15 +313,21 @@ def collect_and_save(
                                          (target_w, target_h),
                                          interpolation=cv2.INTER_NEAREST
                                          ).astype(np.int32)
-                    masks, _ = _masks_from_semantic(sem)     # (K, H, W) bool
-                    masks_f  = masks.astype(np.float32)      # predict_frame wants float
+                    masks, object_ids = _masks_from_semantic(sem)  # (K, H, W) bool
+                    masks_f  = masks.astype(np.float32)             # predict_frame wants float
 
-                    # ── LangGeoNet inference ──────────────────────────────────
+                    # ── Compute per-object costs ─────────────────────────────
                     if masks_f.shape[0] > 0:
-                        distances, _, _ = predictor.predict_frame(
-                            rgb, masks_f, instruction
-                        )                                   # (K,) in [0, 1]
-                        costs = (distances * cost_scale).astype(np.float64)
+                        if use_gt_geodesic:
+                            gt_distances = get_object_geodesic_distances(env, sem)
+                            costs = _gt_costs_from_distances(
+                                object_ids, gt_distances, cost_scale
+                            )
+                        else:
+                            distances, _, _ = predictor.predict_frame(
+                                rgb, masks_f, instruction
+                            )                               # (K,) in [0, 1]
+                            costs = (distances * cost_scale).astype(np.float64)
                     else:
                         costs = np.array([], dtype=np.float64)
 
@@ -364,9 +395,10 @@ def parse_args():
         description="Build LangGeoNet training dataset from Habitat episodes",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--out_dir", required=True,
+    p.add_argument("--out_dir",
+                   default= "/data/ws/VLN-CE/tmp_data",
                    help="Root output directory for the dataset")
-    p.add_argument("--num_episodes", type=int, default=50,
+    p.add_argument("--num_episodes", type=int, default=500,
                    help="Number of episodes to process")
     p.add_argument("--langgeonet_ckpt",
                    default="costmap_predictor/langgeonet/checkpoints/best_model.pt",
@@ -377,9 +409,11 @@ def parse_args():
     p.add_argument("--image_size", type=int, nargs=2, default=[120, 160],
                    metavar=("H", "W"),
                    help="Output image resolution (height width)")
-    p.add_argument("--cost_scale", type=float, default=200.0,
-                   help="Scale factor for LangGeoNet [0,1] distances → path-length costs")
-    p.add_argument("--train_ratio", type=float, default=0.8,
+    p.add_argument("--cost_scale", type=float, default=100.0,
+                   help="Scale factor for [0,1] distances → path-length costs")
+    p.add_argument("--use_gt_geodesic", action="store_true",
+                   help="Use GT geodesic distances instead of LangGeoNet")
+    p.add_argument("--train_ratio", type=float, default=0.9,
                    help="Fraction of trajectories for the train split")
     p.add_argument("--h5_name", default="costmaps.h5",
                    help="Filename of the output HDF5 inside --out_dir")
@@ -407,8 +441,10 @@ def main():
     config.freeze()
     env = VLNCEDaggerEnv(config=config)
 
-    # ── LangGeoNet predictor ────────────────────────────────────────────────
-    predictor = LangGeoNetPredictor(args.langgeonet_ckpt)
+    # ── LangGeoNet predictor (only when not using GT geodesic) ─────────────
+    predictor = None
+    if not args.use_gt_geodesic:
+        predictor = LangGeoNetPredictor(args.langgeonet_ckpt)
 
     # ── Dataset builder ─────────────────────────────────────────────────────
     builder = DatasetBuilder(out_dir=args.out_dir, h5_path=h5_path)
@@ -416,11 +452,12 @@ def main():
     try:
         traj_names = collect_and_save(
             env=env,
-            predictor=predictor,
             builder=builder,
             num_episodes=args.num_episodes,
             image_size=tuple(args.image_size),
             cost_scale=args.cost_scale,
+            predictor=predictor,
+            use_gt_geodesic=args.use_gt_geodesic,
         )
     finally:
         env.close()
