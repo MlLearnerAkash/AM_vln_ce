@@ -361,13 +361,176 @@ def render_attention_figure(
     return np.array(Image.open(buf).convert("RGB"))
 
 
+def render_ranking_comparison_figure(
+    image_np: np.ndarray,
+    masks: np.ndarray,
+    pred_distances: np.ndarray,
+    gt_distances: np.ndarray,
+) -> np.ndarray:
+    """
+    Four-panel ranking comparison figure.
+
+    Panel 1 — GT ranked list with rank-change annotations.
+    Panel 2 — Predicted ranked list with GT rank reference.
+    Panel 3 — Per-object rank-change bar chart.
+    Panel 4 — Scene overlay: each object coloured by rank change
+               (green = ranked closer in pred, red = ranked farther, grey = same).
+    """
+    K = len(gt_distances)
+    labels = [f"obj_{k}" for k in range(K)]
+
+    # rank of each object (0 = closest to goal = smallest distance)
+    gt_rank   = np.argsort(np.argsort(gt_distances)).astype(int)
+    pred_rank = np.argsort(np.argsort(pred_distances)).astype(int)
+    rank_change = gt_rank - pred_rank          # positive → closer in pred
+    gt_order    = np.argsort(gt_distances)
+    pred_order  = np.argsort(pred_distances)
+
+    max_change = max(int(np.abs(rank_change).max()), 1)
+    norm_change = rank_change / max_change     # [-1, 1]
+
+    def _change_color(v):
+        if v > 0:
+            return (0.2, 0.4 + 0.5 * v, 0.2)
+        elif v < 0:
+            return (0.5 + 0.4 * abs(v), 0.2, 0.2)
+        return (0.6, 0.6, 0.6)
+
+    fig = plt.figure(figsize=(20, max(10, K * 0.55 + 4)))
+    gs  = fig.add_gridspec(
+        2, 2,
+        height_ratios=[max(K * 0.45, 4), 4],
+        hspace=0.40, wspace=0.30,
+    )
+    ax_gt    = fig.add_subplot(gs[0, 0])
+    ax_pred  = fig.add_subplot(gs[0, 1])
+    ax_bar   = fig.add_subplot(gs[1, 0])
+    ax_scene = fig.add_subplot(gs[1, 1])
+
+    fig.suptitle(
+        "GT vs Predicted Object Ranking Comparison\n"
+        "(rank #1 = closest to navigation goal)",
+        fontsize=13, fontweight="bold",
+    )
+
+    # --- Panel 1: GT ranked list ---
+    ax_gt.set_xlim(0, 1)
+    ax_gt.set_ylim(-0.5, K - 0.5)
+    ax_gt.invert_yaxis()
+    ax_gt.axis("off")
+    ax_gt.set_title("GT Ranking  (ground truth)", fontsize=11, fontweight="bold")
+
+    for pos, obj_idx in enumerate(gt_order):
+        color = _change_color(norm_change[obj_idx])
+        ax_gt.add_patch(plt.Rectangle(
+            (0, pos - 0.45), 1, 0.9,
+            color=color, alpha=0.25, transform=ax_gt.transData,
+        ))
+        ax_gt.text(0.04, pos, f"#{pos + 1}",
+                   va="center", ha="left", fontsize=10, fontweight="bold")
+        ax_gt.text(0.20, pos, labels[obj_idx],
+                   va="center", ha="left", fontsize=10)
+        ax_gt.text(0.55, pos, f"d={gt_distances[obj_idx]:.3f}",
+                   va="center", ha="left", fontsize=9, color="dimgray")
+        delta = rank_change[obj_idx]
+        if delta > 0:
+            arrow, a_col = f"▲ +{delta}", "#1a7a1a"
+        elif delta < 0:
+            arrow, a_col = f"▼ {delta}", "#aa1111"
+        else:
+            arrow, a_col = "  —", "gray"
+        ax_gt.text(0.82, pos, arrow,
+                   va="center", ha="left", fontsize=9,
+                   fontweight="bold", color=a_col)
+
+    # --- Panel 2: Predicted ranked list ---
+    ax_pred.set_xlim(0, 1)
+    ax_pred.set_ylim(-0.5, K - 0.5)
+    ax_pred.invert_yaxis()
+    ax_pred.axis("off")
+    ax_pred.set_title("Predicted Ranking", fontsize=11, fontweight="bold")
+
+    for pos, obj_idx in enumerate(pred_order):
+        color = _change_color(norm_change[obj_idx])
+        ax_pred.add_patch(plt.Rectangle(
+            (0, pos - 0.45), 1, 0.9,
+            color=color, alpha=0.25, transform=ax_pred.transData,
+        ))
+        ax_pred.text(0.04, pos, f"#{pos + 1}",
+                     va="center", ha="left", fontsize=10, fontweight="bold")
+        ax_pred.text(0.20, pos, labels[obj_idx],
+                     va="center", ha="left", fontsize=10)
+        ax_pred.text(0.55, pos, f"d={pred_distances[obj_idx]:.3f}",
+                     va="center", ha="left", fontsize=9, color="dimgray")
+        ax_pred.text(0.82, pos, f"GT#{gt_rank[obj_idx] + 1}",
+                     va="center", ha="left", fontsize=9, color="steelblue")
+
+    # --- Panel 3: Rank-change bar chart ---
+    obj_colors = [_change_color(norm_change[k]) for k in range(K)]
+    bars = ax_bar.barh(range(K), rank_change, color=obj_colors,
+                       edgecolor="black", linewidth=0.5)
+    ax_bar.set_yticks(range(K))
+    ax_bar.set_yticklabels(labels, fontsize=max(6, 9 - K // 10))
+    ax_bar.axvline(0, color="black", linewidth=1.2)
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("Rank change  (positive = ranked closer in prediction)", fontsize=9)
+    ax_bar.set_title("Per-Object Rank Change  (GT rank − Pred rank)", fontsize=10)
+    for k, bar in enumerate(bars):
+        val = rank_change[k]
+        xoff = 0.1 if val >= 0 else -0.1
+        ax_bar.text(val + xoff, k, f"{val:+d}",
+                    va="center",
+                    ha="left" if val >= 0 else "right",
+                    fontsize=8, fontweight="bold")
+
+    from matplotlib.patches import Patch
+    ax_bar.legend(
+        handles=[
+            Patch(facecolor=_change_color(1.0),  alpha=0.7, label="Ranked closer (↑ in pred)"),
+            Patch(facecolor=_change_color(-1.0), alpha=0.7, label="Ranked farther (↓ in pred)"),
+            Patch(facecolor=_change_color(0.0),  alpha=0.7, label="No rank change"),
+        ],
+        loc="lower right", fontsize=8,
+    )
+
+    # --- Panel 4: Scene overlay coloured by rank change ---
+    overlay = image_np.astype(np.float32) / 255.0
+    for k in range(K):
+        mask  = masks[k] > 0
+        color = np.array(_change_color(norm_change[k]), dtype=np.float32)
+        overlay[mask] = 0.45 * overlay[mask] + 0.55 * color
+        ys, xs = np.where(mask)
+        if len(xs):
+            cx, cy = int(xs.mean()), int(ys.mean())
+            ax_scene.text(
+                cx, cy,
+                f"G{gt_rank[k]+1}→P{pred_rank[k]+1}",
+                fontsize=max(5, 8 - K // 8),
+                ha="center", va="center", color="white", fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.1", fc="black", alpha=0.5),
+            )
+    ax_scene.imshow(np.clip(overlay, 0, 1))
+    ax_scene.set_title(
+        "Scene Overlay — colour = rank change\nLabel: GT rank → Pred rank",
+        fontsize=10,
+    )
+    ax_scene.axis("off")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return np.array(Image.open(buf).convert("RGB"))
+
+
 # ---------------------------------------------------------------------------
 # Main inference function called by Gradio
 # ---------------------------------------------------------------------------
 
 def run_inference(
     image_pil: Image.Image,
-    masks_path: str,          # path to masks .npy file
+    masks_path: str,
     instruction: str,
     checkpoint_path: str,
     device: str,
@@ -406,11 +569,13 @@ def run_inference(
     attn_fig    = render_attention_figure(instruction, attn, len(distances)) if attn is not None else None
 
     # --- GT difference figure (optional) ---
-    gt_diff_fig = None
-    gt_distances = load_gt_distances(masks_path)
+    gt_diff_fig    = None
+    ranking_fig    = None
+    gt_distances   = load_gt_distances(masks_path)
     if gt_distances is not None:
         if len(gt_distances) == len(distances):
             gt_diff_fig = render_gt_diff_figure(image_np, masks, distances, gt_distances)
+            ranking_fig = render_ranking_comparison_figure(image_np, masks, distances, gt_distances)
         else:
             print(
                 f"[app] GT distances length {len(gt_distances)} != "
@@ -427,7 +592,7 @@ def run_inference(
     elif gt_distances is None:
         status += "  |  geodesic_distances.npy not found (no GT diff)"
 
-    return costmap_fig, per_obj_fig, attn_fig, gt_diff_fig, status
+    return costmap_fig, per_obj_fig, attn_fig, gt_diff_fig, ranking_fig, status
 
 
 # ---------------------------------------------------------------------------
@@ -435,14 +600,12 @@ def run_inference(
 # ---------------------------------------------------------------------------
 
 def build_app(checkpoint_path: str, device: str = None, share: bool = False):
-    import gradio as gr  # type: ignore[import]
-    import torch  # type: ignore[import]
+    import gradio as gr
+    import torch
 
-    # Resolve device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Pre-load model so first request is fast
     print(f"Pre-loading model from {checkpoint_path} on {device} …")
     get_predictor(checkpoint_path, device)
 
@@ -480,6 +643,10 @@ def build_app(checkpoint_path: str, device: str = None, share: bool = False):
                     label="GT vs Predicted Distances  (geodesic_distances.npy)",
                     type="numpy",
                 )
+                ranking_out = gr.Image(
+                    label="GT vs Predicted Ranking Comparison",
+                    type="numpy",
+                )
                 costmap_out = gr.Image(
                     label="Costmap Visualization",
                     type="numpy",
@@ -492,12 +659,11 @@ def build_app(checkpoint_path: str, device: str = None, share: bool = False):
                     label="Cross-Attention Map",
                     type="numpy",
                 )
-                
 
         run_btn.click(
             fn=lambda img, masks, txt: run_inference(img, masks, txt, checkpoint_path, device),
             inputs=[image_input, masks_input, instruction_input],
-            outputs=[costmap_out, per_obj_out, attn_out, gt_diff_out, status_box],
+            outputs=[costmap_out, per_obj_out, attn_out, gt_diff_out, ranking_out, status_box],
             api_name=False,
         )
 

@@ -32,6 +32,7 @@ from utils.obj_react_velo_to_action import apply_velocity
 from vlnce_baselines.common.environments import VLNCEDaggerEnv
 from habitat_extensions.utils import generate_video, observations_to_image
 from habitat.utils.visualizations.utils import append_text_to_image
+from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances, encode_normalized_distances_to_frame
 
 
 # #Discrete object react
@@ -326,42 +327,45 @@ def decide_action(waypoints,
 import habitat_sim
 from habitat_sim.utils.common import quat_to_magnum, quat_from_magnum
 
-def move_agent_by_waypoint(wp, agent, sim, time_step=0.1):
+def move_agent_by_waypoint(wp, agent, sim, time_step=0.1, num_steps=5):
     """
-    Move agent to the first waypoint in the local (dx, dy) frame.
+    Move agent through the first `num_steps` waypoints in the local (dx, dy) frame.
     wp: np.ndarray [N, 2], wp[i] = (cumulative_forward, cumulative_lateral)
+    Since coordinates are cumulative, the incremental delta at step i is wp[i] - wp[i-1].
     """
-    dx = float(wp[0, 0])   # forward displacement in agent frame
-    dy = float(wp[0, 1])   # lateral displacement (+left in GNM)
+    n = min(num_steps, len(wp))
+    prev = np.array([0.0, 0.0])  # cumulative origin
 
-    state = agent.state
+    for i in range(n):
+        curr = wp[i]
+        delta = curr - prev          # incremental displacement from last position
+        dx = float(delta[0])         # forward
+        dy = float(delta[1])         # lateral (+left in GNM)
+        prev = curr
 
-    # Build local-frame axis vectors from current rotation
-    forward_vec = habitat_sim.utils.quat_rotate_vector(
-        state.rotation, np.array([0, 0, -1.0])   # Habitat: forward = -Z local
-    )
-    left_vec = habitat_sim.utils.quat_rotate_vector(
-        state.rotation, np.array([-1.0, 0, 0])   # Habitat: left = -X local
-    )
+        state = agent.state
 
-    # Compute target world position
-    target_pos = state.position + forward_vec * dx + left_vec * dy
+        forward_vec = habitat_sim.utils.quat_rotate_vector(
+            state.rotation, np.array([0, 0, -1.0])
+        )
+        left_vec = habitat_sim.utils.quat_rotate_vector(
+            state.rotation, np.array([-1.0, 0, 0])
+        )
 
-    # Optionally update heading to face the waypoint direction
-    yaw = np.arctan2(dy, dx)   # heading correction in radians
-    delta_rot = habitat_sim.utils.quat_from_angle_axis(yaw, np.array([0, 1.0, 0]))
-    new_rotation = delta_rot * state.rotation
+        target_pos = state.position + forward_vec * dx + left_vec * dy
 
-    # Snap to navmesh to avoid walking through walls
-    end_pos = sim.step_filter(state.position, target_pos)
+        yaw = np.arctan2(dy, dx)
+        delta_rot = habitat_sim.utils.quat_from_angle_axis(yaw, np.array([0, 1.0, 0]))
+        new_rotation = delta_rot * state.rotation
 
-    state.position = end_pos
-    state.rotation = quat_from_magnum(
-        quat_to_magnum(new_rotation)
-    )
-    agent.set_state(state)
+        end_pos = sim.step_filter(state.position, target_pos)
 
-    sim.step_physics(dt=time_step)
+        state.position = end_pos
+        state.rotation = quat_from_magnum(quat_to_magnum(new_rotation))
+        agent.set_state(state)
+
+        sim.step_physics(dt=time_step)
+
     return agent, sim
 
 if __name__ == "__main__":
@@ -374,6 +378,12 @@ if __name__ == "__main__":
     #          TURN_RIGHT / STOP) derived from decide_action().
     # False → use apply_velocity() with continuous velocity control.
     USE_DISCRETE_ACTIONS = False
+
+    # ── Observation source ────────────────────────────────────────────────
+    # True  → use live RGB + semantic from the simulator at each step and
+    #          compute geodesic heatmaps on-the-fly.
+    # False → use pre-collected GT frames / norm_frames from episode_generator.
+    USE_LIVE_OBS = True
 
     # Discrete-action map: decide_action() labels → Habitat action names
     DISCRETE_ACTION_MAP = {
@@ -495,8 +505,12 @@ if __name__ == "__main__":
                 task=env._env.task
             )
             
-            # Recalculate observations from the restored initial position
-            obs = sim.get_sensor_observations()
+            # Initialize agent by executing the first GT action so the agent
+            gt_actions = episode_data.get("gt_actions", [])
+            if gt_actions:
+                obs, _, _, _ = env.step(gt_actions[0])
+            else:
+                obs = sim.get_sensor_observations()
             
             if len(frames) != len(norm_frames):
                 print(f"Skipping episode {episode_id}: image and heatmap sequence lengths do not match.")
@@ -505,47 +519,43 @@ if __name__ == "__main__":
             epoch_loss= []
             video_frames = []  # Collect frames for video generation
             
-            with tempfile.TemporaryDirectory(prefix=f"episode_{episode_id}_") as temp_dir:
-                frame_paths, semantic_paths, norm_frame_paths = save_numpy_images_to_temp(frames, semantic_frames, norm_frames, temp_dir)
-                instruction = episode_data["instruction"]
+            max_steps = len(frames)  # match GT trajectory length
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
+            if USE_LIVE_OBS:
+                # ════════════════════════════════════════════════════════════
+                # LIVE OBS MODE: RGB + semantic read from the simulator at
+                # each step; heatmaps computed on-the-fly from geodesic dists.
+                # ════════════════════════════════════════════════════════════
+                for _ in range(max_steps):
+                    if env._env.episode_over:
+                        break
 
-                for frame_path,semantic_path, heatmap_path in zip(frame_paths,semantic_paths, norm_frame_paths):
-                    
-                    #NOTE: GT semantic map
-                    semantic_map  = np.load(semantic_path)
-                    frame = np.array(Image.open(frame_path))
+                    # ── Live RGB + semantic from current simulator state ────
+                    frame = np.array(obs["rgb"])
+                    semantic_map = obs["semantic"].astype(np.int32)
 
-                    gt_heatmap= np.array(Image.open(heatmap_path).convert("L")).astype(np.float32)
-                    gt_heatmap_img = np.array(Image.open(heatmap_path).convert("L")).astype(np.float32)
+                    # ── Compute GT heatmap from live geodesic distances ─────
+                    distances = get_object_geodesic_distances(env, semantic_map)
+                    norm_frame_live = encode_normalized_distances_to_frame(semantic_map, distances)
+                    gt_heatmap_img = norm_frame_live.astype(np.float32)
                     gt_heatmap_img = (gt_heatmap_img - gt_heatmap_img.min()) / (gt_heatmap_img.ptp() + 1e-8)
                     gt_heatmap_resized = cv2.resize(gt_heatmap_img, (7, 7), interpolation=cv2.INTER_AREA)
-                    gt_heatmap = torch.from_numpy(gt_heatmap_resized).unsqueeze(0).to("cuda" if torch.cuda.is_available() else "cpu")
+                    gt_heatmap = torch.from_numpy(gt_heatmap_resized).unsqueeze(0).to(device)
 
-                    #NOTE: frame/semenaitcs from current obseravtions
-                    # obs = sim.get_sensor_observations()
-                    # frame= np.array(obs["rgb"])
-                    # semantic_map = obs["semantic"].astype(np.int32)
-                    
-
-
-                    # Forward pass for a single image
+                    # ── Forward pass ────────────────────────────────────────
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
                     mask, pls = get_goal_image_langgeonet(frame, semantic_map, instruction, langgeonet)
-                    # mask, pls= get_goal_image(frame, gt_heatmap) #pred_heatmap
+                    # mask, pls = get_goal_image(frame, gt_heatmap)  # pred_heatmap
 
-                    wp, v, w, vis_img= object_react_controller.predict(frame, (mask, pls))
+                    wp, v, w, vis_img = object_react_controller.predict(frame, (mask, pls))
 
-                    action, angle_deg= decide_action(wp)
+                    action, angle_deg = decide_action(wp)
 
                     if USE_DISCRETE_ACTIONS:
                         # ── Discrete action branch ──────────────────────────
-                        # Guard: don't step into an already-finished episode
-                        if env._env.episode_over:
-                            break
                         habitat_action = DISCRETE_ACTION_MAP.get(action, "MOVE_FORWARD")
                         step_result = env.step({"action": habitat_action})
-                        # VLNCEDaggerEnv.step() returns (obs, done) or just obs
                         if isinstance(step_result, tuple):
                             obs, _, done, info = step_result
                         else:
@@ -553,31 +563,10 @@ if __name__ == "__main__":
                         sim = env._env.sim
                         agent = env._env.sim.get_agent(0)
                         info = env._env.get_metrics()
-                        collided = False
-                        # STOP or episode finished — exit the frame loop
                         if habitat_action == "STOP" or env._env.episode_over:
                             break
                     else:
                         # ── Velocity control branch ─────────────────────────
-                        # agent, sim, collided = apply_velocity(
-                        #     vel_control, agent, sim,
-                        #     velocity=v, steer=-w, time_step=0.1,
-                        #     translation_gain=TRANSLATION_GAIN,
-                        #     rotation_gain=ROTATION_GAIN,
-                        # )
-
-                        # #Forces the environment to recalculate all metrics based on current simulator state.
-                        # env._env._task.measurements.update_measures(
-                        #     episode=env._env.current_episode,
-                        #     action={"action": "VELOCITY_CONTROL"},  # Dummy action
-                        #     task=env._env.task
-                        # )
-
-                        # env._env._update_step_stats()
-
-                        # # Get observations and metrics after velocity update
-                        # obs = sim.get_sensor_observations()
-                        # info = env._env.get_metrics()
                         if np.linalg.norm(wp[0]) < 0.05:
                             break  # reached goal
 
@@ -592,19 +581,90 @@ if __name__ == "__main__":
                         env._env._update_step_stats()
                         obs = sim.get_sensor_observations()
                         info = env._env.get_metrics()
-                    
-                    #Adding Vis_img
+
+                    # ── Build video frame ───────────────────────────────────
                     obs['vis_img'] = vis_img
-                    # Create video frame
                     video_frame = observations_to_image(obs, info)
                     video_frame = append_text_to_image(video_frame, instruction)
                     video_frames.append(video_frame)
-                    
+
                     step_count += 1
-                    
-                    # Log collision
-                    # if collided:
-                    #     logger.info(f"Collision detected at step {step_count}")
+
+            else:
+                # ════════════════════════════════════════════════════════════
+                # GT FRAMES MODE: use pre-collected frames / norm_frames from
+                # episode_generator (saved to a temp dir and read back).
+                # ════════════════════════════════════════════════════════════
+                with tempfile.TemporaryDirectory(prefix=f"episode_{episode_id}_") as temp_dir:
+                    frame_paths, semantic_paths, norm_frame_paths = save_numpy_images_to_temp(
+                        frames, semantic_frames, norm_frames, temp_dir
+                    )
+
+                    for frame_path, semantic_path, heatmap_path in zip(frame_paths, semantic_paths, norm_frame_paths):
+
+                        # NOTE: GT semantic map
+                        semantic_map = np.load(semantic_path)
+                        frame = np.array(Image.open(frame_path))
+
+                        gt_heatmap_img = np.array(Image.open(heatmap_path).convert("L")).astype(np.float32)
+                        gt_heatmap_img = (gt_heatmap_img - gt_heatmap_img.min()) / (gt_heatmap_img.ptp() + 1e-8)
+                        gt_heatmap_resized = cv2.resize(gt_heatmap_img, (7, 7), interpolation=cv2.INTER_AREA)
+                        gt_heatmap = torch.from_numpy(gt_heatmap_resized).unsqueeze(0).to(device)
+
+                        # Forward pass for a single image
+                        pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
+                        # mask, pls = get_goal_image_langgeonet(frame, semantic_map, instruction, langgeonet)
+                        mask, pls = get_goal_image(frame, gt_heatmap)  # pred_heatmap
+
+                        wp, v, w, vis_img = object_react_controller.predict(frame, (mask, pls))
+
+                        action, angle_deg = decide_action(wp)
+
+                        if USE_DISCRETE_ACTIONS:
+                            # ── Discrete action branch ──────────────────────
+                            if env._env.episode_over:
+                                break
+                            habitat_action = DISCRETE_ACTION_MAP.get(action, "MOVE_FORWARD")
+                            step_result = env.step({"action": habitat_action})
+                            if isinstance(step_result, tuple):
+                                obs, _, done, info = step_result
+                            else:
+                                obs = step_result
+                            sim = env._env.sim
+                            agent = env._env.sim.get_agent(0)
+                            info = env._env.get_metrics()
+                            collided = False
+                            if habitat_action == "STOP" or env._env.episode_over:
+                                break
+                        else:
+                            # ── Velocity control branch ─────────────────────
+                            if np.linalg.norm(wp[0]) < 0.05:
+                                break  # reached goal
+
+                            agent, sim = move_agent_by_waypoint(wp, agent, sim)
+
+                            # Update env metrics
+                            env._env._task.measurements.update_measures(
+                                episode=env._env.current_episode,
+                                action={"action": "VELOCITY_CONTROL"},
+                                task=env._env.task
+                            )
+                            env._env._update_step_stats()
+                            obs = sim.get_sensor_observations()
+                            info = env._env.get_metrics()
+
+                        # Adding Vis_img
+                        obs['vis_img'] = vis_img
+                        # Create video frame
+                        video_frame = observations_to_image(obs, info)
+                        video_frame = append_text_to_image(video_frame, instruction)
+                        video_frames.append(video_frame)
+
+                        step_count += 1
+
+                        # Log collision
+                        # if collided:
+                        #     logger.info(f"Collision detected at step {step_count}")
             
             # Collect per-episode metrics
             final_info = env._env.get_metrics()

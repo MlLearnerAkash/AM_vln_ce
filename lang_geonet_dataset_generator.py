@@ -340,7 +340,7 @@ if __name__ == "__main__":
     )
     p_on.add_argument(
         "--data_root",
-        default="/data/ws/data_langgeonet",
+        default="/media/opervu-user/Data2/ws/data_langgeonet",
         help="Root output directory for the dataset",
     )
     p_on.add_argument(

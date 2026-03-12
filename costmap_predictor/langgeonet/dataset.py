@@ -64,7 +64,7 @@ class LangGeoNetDataset(Dataset):
         if os.path.exists(split_file):
             with open(split_file, "r") as f:
                 episode_ids = [line.strip() for line in f if line.strip()]
-            episode_dirs = [os.path.join(self.data_root, eid) for eid in episode_ids]
+            episode_dirs = [os.path.join(self.data_root, "episode_"+eid) for eid in episode_ids]
         else:
             episode_dirs = sorted(glob.glob(os.path.join(self.data_root, "episode_*")))
 
