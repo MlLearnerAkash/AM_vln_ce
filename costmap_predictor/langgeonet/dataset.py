@@ -25,7 +25,9 @@ Expected directory structure:
 
 import os
 import glob
+import json
 import numpy as np
+import h5py
 from PIL import Image
 
 import torch
@@ -182,3 +184,228 @@ def create_dataloaders(data_root, batch_size=8, num_workers=4,
         pin_memory=True,
     )
     return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# H5-backed dataset: RLE masks + PL scores + JSONL instructions
+# ---------------------------------------------------------------------------
+
+class H5MaskPLSDataset(Dataset):
+    """
+    Dataset that loads per-frame RGB images, instance-segmentation masks, and
+    per-object path-length (PL) scores from an HDF5 file, paired with
+    natural-language instructions supplied through a JSONL file.
+
+    HDF5 structure
+    --------------
+    Top-level key  : "{ep_folder}_{frame_idx}"   e.g. "1S7LAXRdDqK_0000000_plant_42__0"
+    Sub-datasets:
+        img_masks/{i}  int64 1-D  – F-major alternating skip/set RLE for mask i
+        img_pls        float64 [K] – per-object PL scores
+        size           int64   [2] – [H, W] of the frame
+
+    JSONL structure (one JSON object per line)
+    ------------------------------------------
+        {"filename": "<ep_folder_name>", "instruction": "natural language ..."}
+
+    "filename" is matched to the episode-folder component of the H5 key.
+    Trailing underscores are stripped on both sides before comparison, so
+    "1S7LAXRdDqK_0000000_plant_42_" matches "1S7LAXRdDqK_0000000_plant_42_"
+    (or the same string without the trailing underscore).
+
+    Image path
+    ----------
+    {base_dir}/trajectories/{ep_folder}/images/{frame_idx:05d}.png
+    """
+
+    def __init__(
+        self,
+        h5_path: str,
+        jsonl_path: str,
+        base_dir: str,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
+        max_instruction_length: int = 77,
+    ):
+        super().__init__()
+        self.h5_path = h5_path
+        self.traj_root = os.path.join(base_dir, "trajectories")
+        self.max_instruction_length = max_instruction_length
+        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+
+        # H5 handle – opened lazily in each DataLoader worker (fork-safe).
+        self._h5 = None
+
+        # Build instruction lookup: stripped_ep_folder -> instruction
+        instruction_map: dict[str, str] = {}
+        with open(jsonl_path, "r") as fj:
+            for line in fj:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                instruction_map[entry["file"].removesuffix(".gif").rstrip("_")] = entry["instruction"]
+
+        # Index all H5 keys that have a matching instruction entry.
+        self.samples: list[dict] = []
+        with h5py.File(h5_path, "r") as h5:
+            for sample_key in h5.keys():
+                # Split off the frame index from the right.
+                ep_folder, frame_str = sample_key.rsplit("_", 1)
+                lookup_key = ep_folder.rstrip("_")
+                if lookup_key not in instruction_map:
+                    continue
+                self.samples.append({
+                    "sample_key":  sample_key,
+                    "ep_folder":   ep_folder,
+                    "frame_idx":   int(frame_str),
+                    "instruction": instruction_map[lookup_key],
+                })
+
+        print(
+            f"[H5MaskPLSDataset] {len(self.samples)} samples from "
+            f"{len(set(s['ep_folder'] for s in self.samples))} episodes"
+        )
+
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _open_h5(self) -> "h5py.File":
+        """Open the HDF5 file lazily (once per DataLoader worker process)."""
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5_path, "r")
+        return self._h5
+
+    @staticmethod
+    def _decode_rle_mask(rle: np.ndarray, H: int, W: int) -> np.ndarray:
+        """
+        Decode a 1-D F-major alternating skip/set RLE into a (H, W) bool array.
+
+        The RLE lists run lengths over a Fortran-order (column-major) flattened
+        view of the image.  Runs at even positions (0, 2, …) are background
+        (skip); runs at odd positions (1, 3, …) are foreground (set).
+        """
+        flat = np.zeros(H * W, dtype=bool)
+        pos = 0
+        for i, count in enumerate(rle):
+            if i % 2 == 1:          # odd index → foreground run
+                flat[pos: pos + count] = True
+            pos += count
+        return np.reshape(flat, (H, W), order="F")
+
+    def __getitem__(self, idx: int) -> dict:
+        meta = self.samples[idx]
+        h5   = self._open_h5()
+        grp  = h5[meta["sample_key"]]
+
+        H, W = int(grp["size"][0]), int(grp["size"][1])
+
+        # Decode all masks from F-major RLE.
+        masks_grp = grp["img_masks"]
+        n_masks   = len(masks_grp)
+        masks = np.stack(
+            [self._decode_rle_mask(masks_grp[str(i)][()], H, W)
+             for i in range(n_masks)],
+            axis=0,
+        )  # [K, H, W]  bool
+
+        # PL scores – min-max normalized to [0, 1] per frame.
+        pls = grp["img_pls"][()].astype(np.float32)  # [K]
+        pls_min, pls_max = pls.min(), pls.max()
+        if pls_max - pls_min > 1e-6:
+            pls = (pls - pls_min) / (pls_max - pls_min)
+        else:
+            pls = np.zeros_like(pls)
+
+        # RGB image.
+        img_path = os.path.join(
+            self.traj_root,
+            meta["ep_folder"],
+            "images",
+            f"{meta['frame_idx']:05d}.png",
+        )
+        image       = Image.open(img_path).convert("RGB")
+        clip_img    = self.clip_processor(images=image, return_tensors="pt")
+        pixel_values = clip_img["pixel_values"].squeeze(0)  # [3, 224, 224]
+
+        # Instruction tokens.
+        clip_text = self.clip_processor(
+            text=meta["instruction"],
+            max_length=self.max_instruction_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids     = clip_text["input_ids"].squeeze(0)      # [L]
+        attention_mask = clip_text["attention_mask"].squeeze(0) # [L]
+
+        return {
+            "pixel_values":  pixel_values,                    # [3, 224, 224]
+            "masks":         torch.from_numpy(masks).bool(),  # [K, H, W]
+            "pls":           torch.from_numpy(pls),           # [K]
+            "input_ids":     input_ids,                       # [L]
+            "attention_mask": attention_mask,                  # [L]
+            "num_objects":   n_masks,
+            "sample_key":    meta["sample_key"],
+            "ep_folder":     meta["ep_folder"],
+            "frame_idx":     meta["frame_idx"],
+        }
+
+
+def h5_maskpls_collate_fn(batch: list[dict]) -> dict:
+    """
+    Collate for H5MaskPLSDataset.
+
+    Fixed-size tensors are stacked; variable-size masks and pls are kept as
+    lists (one element per sample in the batch).
+    """
+    return {
+        "pixel_values":    torch.stack([b["pixel_values"]   for b in batch]),
+        "input_ids":       torch.stack([b["input_ids"]      for b in batch]),
+        "attention_mask":  torch.stack([b["attention_mask"] for b in batch]),
+        "masks_list":      [b["masks"] for b in batch],
+        "pls_list":        [b["pls"]   for b in batch],
+        "num_objects":     [b["num_objects"] for b in batch],
+        "sample_keys":     [b["sample_key"]  for b in batch],
+    }
+
+
+def create_h5_maskpls_dataloader(
+    h5_path: str,
+    jsonl_path: str,
+    base_dir: str,
+    batch_size: int = 8,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    clip_model: str = "openai/clip-vit-base-patch16",
+) -> DataLoader:
+    """
+    Convenience factory that returns a single DataLoader backed by
+    H5MaskPLSDataset.
+
+    Parameters
+    ----------
+    h5_path    : path to the HDF5 file containing masks and PL scores.
+    jsonl_path : path to the JSONL file with "filename" / "instruction" pairs.
+    base_dir   : root directory that contains the ``trajectories/`` sub-folder.
+    batch_size : samples per batch.
+    shuffle    : whether to shuffle the dataset each epoch.
+    num_workers: number of DataLoader worker processes.
+    clip_model : HuggingFace model name used for image/text preprocessing.
+    """
+    ds = H5MaskPLSDataset(
+        h5_path=h5_path,
+        jsonl_path=jsonl_path,
+        base_dir=base_dir,
+        clip_model_name=clip_model,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=h5_maskpls_collate_fn,
+        pin_memory=True,
+        drop_last=shuffle,   # drop incomplete batches only during training
+    )
