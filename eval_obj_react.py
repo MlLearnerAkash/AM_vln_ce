@@ -327,7 +327,7 @@ def decide_action(waypoints,
 import habitat_sim
 from habitat_sim.utils.common import quat_to_magnum, quat_from_magnum
 
-def move_agent_by_waypoint(wp, agent, sim, time_step=0.1, num_steps=5):
+def move_agent_by_waypoint(wp, agent, sim, time_step=0.1, num_steps=1):
     """
     Move agent through the first `num_steps` waypoints in the local (dx, dy) frame.
     wp: np.ndarray [N, 2], wp[i] = (cumulative_forward, cumulative_lateral)
@@ -474,7 +474,7 @@ if __name__ == "__main__":
     episode_metrics = []  # collect per-episode SDTW/NDTW/SPL
 
     for epoch in range(NUM_EPOCHS):
-        for episode_data in episode_generator(env, num_episodes=1):
+        for episode_data in episode_generator(env, num_episodes=36):
             episode_id = episode_data["episode_id"]
             instruction = episode_data["instruction"]
             frames = episode_data["frames"]
@@ -545,8 +545,8 @@ if __name__ == "__main__":
 
                     # ── Forward pass ────────────────────────────────────────
                     pred_heatmap = rank_predictor.generate_heatmap(frame, instruction)
-                    mask, pls = get_goal_image_langgeonet(frame, semantic_map, instruction, langgeonet)
-                    # mask, pls = get_goal_image(frame, gt_heatmap)  # pred_heatmap
+                    # mask, pls = get_goal_image_langgeonet(frame, semantic_map, instruction, langgeonet)
+                    mask, pls = get_goal_image(frame, gt_heatmap)  # pred_heatmap
 
                     wp, v, w, vis_img = object_react_controller.predict(frame, (mask, pls))
 
@@ -706,12 +706,24 @@ if __name__ == "__main__":
 
     # ── Aggregate metrics across all episodes ───────────────────────────────
     if episode_metrics:
+        def _has_inf(m):
+            return any(
+                v is not None and np.isinf(v)
+                for k, v in m.items()
+                if k != "episode_id" and k != "steps"
+            )
+
+        valid_metrics = [m for m in episode_metrics if not _has_inf(m)]
+        skipped = len(episode_metrics) - len(valid_metrics)
+        if skipped:
+            logger.info(f"Skipping {skipped} episode(s) with inf metric values.")
+
         def _mean(key):
-            vals = [m[key] for m in episode_metrics if m[key] is not None]
+            vals = [m[key] for m in valid_metrics if m[key] is not None]
             return float(np.mean(vals)) if vals else float("nan")
 
         logger.info("=" * 60)
-        logger.info(f"RESULTS over {len(episode_metrics)} episodes:")
+        logger.info(f"RESULTS over {len(valid_metrics)} episodes (skipped {skipped} with inf):")
         logger.info(f"  SDTW    : {_mean('sdtw'):.4f}")
         logger.info(f"  NDTW    : {_mean('ndtw'):.4f}")
         logger.info(f"  SPL     : {_mean('spl'):.4f}")
