@@ -525,6 +525,191 @@ def render_ranking_comparison_figure(
 
 
 # ---------------------------------------------------------------------------
+# H5-mode visualization
+# ---------------------------------------------------------------------------
+
+def render_h5_result_figure(
+    image_np: np.ndarray,
+    masks: np.ndarray,
+    pred_distances: np.ndarray,
+    gt_distances: np.ndarray,
+    instruction: str,
+) -> np.ndarray:
+    """
+    Four-panel figure for H5 demo:
+      1. Input frame
+      2. GT costmap  (normalised PL scores painted onto masks)
+      3. Predicted costmap
+      4. Ranking accuracy breakdown (bar chart sorted by GT rank,
+         colour-coded by agreement with predicted rank)
+    """
+    K, H, W = masks.shape
+
+    # Build per-pixel costmap maps (background stays NaN → white)
+    gt_map   = np.full((H, W), np.nan, dtype=np.float32)
+    pred_map = np.full((H, W), np.nan, dtype=np.float32)
+    for k in range(K):
+        px           = masks[k] > 0
+        gt_map[px]   = gt_distances[k]
+        pred_map[px] = pred_distances[k]
+
+    # Ranking accuracy: fraction of pairs with the same relative order
+    n_pairs = n_correct = 0
+    for i in range(K):
+        for j in range(i + 1, K):
+            n_pairs += 1
+            if (gt_distances[i] < gt_distances[j]) == (pred_distances[i] < pred_distances[j]):
+                n_correct += 1
+    ranking_acc = n_correct / n_pairs if n_pairs > 0 else 1.0
+
+    # Shared colour scale (0 → 1 since both are normalised)
+    cmap_shared = "RdYlGn_r"
+
+    fig, axes = plt.subplots(1, 4, figsize=(26, 6))
+    fig.suptitle(
+        f'Instruction: "{instruction}"\n'
+        f'{K} objects  |  Ranking Accuracy: {ranking_acc:.3f} '
+        f'({n_correct}/{n_pairs} pairs correct)',
+        fontsize=11,
+    )
+
+    # --- Panel 1: Input frame ---
+    axes[0].imshow(image_np)
+    axes[0].set_title("Input Frame")
+    axes[0].axis("off")
+
+    # --- Panel 2: GT costmap ---
+    im1 = axes[1].imshow(gt_map, cmap=cmap_shared, vmin=0, vmax=1)
+    axes[1].set_title("GT Costmap\n(normalised PL score)")
+    axes[1].axis("off")
+    plt.colorbar(im1, ax=axes[1], fraction=0.046, label="GT distance")
+
+    # --- Panel 3: Predicted costmap ---
+    im2 = axes[2].imshow(pred_map, cmap=cmap_shared, vmin=0, vmax=1)
+    axes[2].set_title("Predicted Costmap")
+    axes[2].axis("off")
+    plt.colorbar(im2, ax=axes[2], fraction=0.046, label="Pred distance")
+
+    # --- Panel 4: Ranking accuracy breakdown ---
+    ax4 = axes[3]
+    gt_order   = np.argsort(gt_distances)               # [K] object indices sorted GT
+    pred_ranks = np.argsort(np.argsort(pred_distances)) # [K] 0-based predicted rank per object
+
+    bar_colors = []
+    for pos, k in enumerate(gt_order):
+        gt_r   = int(pos)
+        pred_r = int(pred_ranks[k])
+        diff   = abs(gt_r - pred_r)
+        if diff == 0:
+            bar_colors.append("#2ca02c")    # green  — exact match
+        elif diff == 1:
+            bar_colors.append("#ff7f0e")    # orange — off by one
+        else:
+            bar_colors.append("#d62728")    # red    — larger error
+
+    ax4.barh(range(K), gt_distances[gt_order], color=bar_colors, alpha=0.80,
+             edgecolor="black", linewidth=0.4)
+    ax4.set_yticks(range(K))
+    ax4.set_yticklabels(
+        [f"GT#{p+1}: obj_{k}  →  pred#{pred_ranks[k]+1}"
+         for p, k in enumerate(gt_order)],
+        fontsize=max(5, 8 - K // 8),
+    )
+    ax4.invert_yaxis()
+    ax4.set_xlabel("GT distance (normalised)")
+    ax4.set_title(
+        f"Ranking  (Acc = {ranking_acc:.3f})\n"
+        "green = exact, orange = ±1, red = larger",
+        fontsize=9,
+    )
+    ax4.set_xlim(0, 1.15)
+
+    from matplotlib.patches import Patch
+    ax4.legend(
+        handles=[
+            Patch(facecolor="#2ca02c", alpha=0.8, label="Exact rank match"),
+            Patch(facecolor="#ff7f0e", alpha=0.8, label="Off by 1"),
+            Patch(facecolor="#d62728", alpha=0.8, label="Larger error"),
+        ],
+        loc="lower right",
+        fontsize=7,
+    )
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return np.array(Image.open(buf).convert("RGB"))
+
+
+# ---------------------------------------------------------------------------
+# H5 inference function called by Gradio
+# ---------------------------------------------------------------------------
+
+def run_h5_inference(
+    h5_path: str,
+    base_dir: str,
+    episode_id: str,
+    frame_idx: int,
+    instruction: str,
+    checkpoint_path: str,
+    device: str,
+):
+    """Load one H5 frame and produce the 4-panel H5 result figure."""
+    h5_path    = (h5_path or "").strip()
+    base_dir   = (base_dir or "").strip() or None
+    episode_id = (episode_id or "").strip()
+    instruction = (instruction or "").strip()
+
+    if not h5_path:
+        return None, "Please enter the path to the HDF5 file."
+    if not os.path.isfile(h5_path):
+        return None, f"HDF5 file not found: {h5_path}"
+    if base_dir and not os.path.isdir(base_dir):
+        return None, f"Base directory not found: {base_dir}"
+    if not episode_id:
+        return None, "Please enter an episode folder name (e.g. '1S7LAXRdDqK_0000000_plant_42_')."
+    if not instruction:
+        return None, "Please enter a navigation instruction."
+
+    try:
+        predictor = get_predictor(checkpoint_path, device)
+        image_pil, masks, pred_dist, gt_dist, costmap, attn = predictor.predict_from_h5(
+            h5_path=h5_path,
+            episode_id=episode_id,
+            frame_idx=int(frame_idx),
+            instruction=instruction,
+            base_dir=base_dir,
+        )
+    except (KeyError, FileNotFoundError) as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, f"Inference error: {exc}"
+
+    if len(pred_dist) == 0:
+        return None, "No valid objects in this frame after mask filtering."
+
+    image_np  = np.array(image_pil)
+    result_fig = render_h5_result_figure(image_np, masks, pred_dist, gt_dist, instruction)
+
+    n_pairs    = len(pred_dist) * (len(pred_dist) - 1) // 2
+    n_correct  = sum(
+        1 for i in range(len(pred_dist))
+        for j in range(i + 1, len(pred_dist))
+        if (gt_dist[i] < gt_dist[j]) == (pred_dist[i] < pred_dist[j])
+    )
+    ranking_acc = n_correct / n_pairs if n_pairs > 0 else 1.0
+    mae         = float(np.abs(pred_dist - gt_dist).mean())
+
+    status = (
+        f"Done.  {len(pred_dist)} objects  |  "
+        f"Ranking Accuracy: {ranking_acc:.4f}  |  MAE vs GT: {mae:.4f}"
+    )
+    return result_fig, status
+
+
+# ---------------------------------------------------------------------------
 # Main inference function called by Gradio
 # ---------------------------------------------------------------------------
 
@@ -618,66 +803,151 @@ def build_app(checkpoint_path: str, device: str = None, share: bool = False):
             """
         )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                image_input = gr.Image(
-                    type="pil",
-                    label="Scene Image (RGB)",
-                    height=320,
-                )
-                masks_input = gr.Textbox(
-                    label="Masks file path  (.npy, shape [K, H, W])",
-                    placeholder="/path/to/masks.npy",
-                    lines=1,
-                )
-                instruction_input = gr.Textbox(
-                    label="Navigation Instruction",
-                    placeholder='e.g. "Go to the lamp on the nightstand"',
-                    lines=2,
-                )
-                run_btn = gr.Button("Run Inference", variant="primary")
-                status_box = gr.Textbox(label="Status", interactive=False, lines=1)
+        with gr.Tabs():
 
-            with gr.Column(scale=2):
-                gt_diff_out = gr.Image(
-                    label="GT vs Predicted Distances  (geodesic_distances.npy)",
-                    type="numpy",
+
+            # ----------------------------------------------------------------
+            # Tab 1 — H5 dataset inference
+            # ----------------------------------------------------------------
+            with gr.Tab("IIN Dataset Demo"):
+                gr.Markdown(
+                    """
+                    ### IIN Dataset Demo
+                    Select an episode and frame from the HDF5 costmap file.
+                    The model will run inference with your custom instruction
+                    and compare the prediction against the stored GT path-length scores.
+
+                    **HDF5 key format**: `ep_{episode_id}_{frame_idx}`  
+                    **RGB image path**: `<h5_dir>/ep_{episode_id}/images/{frame_idx:05d}.png`
+                    """
                 )
-                ranking_out = gr.Image(
-                    label="GT vs Predicted Ranking Comparison",
-                    type="numpy",
-                )
-                costmap_out = gr.Image(
-                    label="Costmap Visualization",
-                    type="numpy",
-                )
-                per_obj_out = gr.Image(
-                    label="Per-Object Distance Chart",
-                    type="numpy",
-                )
-                attn_out = gr.Image(
-                    label="Cross-Attention Map",
-                    type="numpy",
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        h5_path_input = gr.Textbox(
+                            label="HDF5 file path  (*.h5)",
+                            placeholder="/path/to/bigger_bot_0.3-sh_0.4_gt_topometric_e3d_masks_pls.h5",
+                            lines=1,
+                        )
+                        h5_base_dir_input = gr.Textbox(
+                            label="Base directory  (contains trajectories/ sub-folder)",
+                            placeholder="/path/to/training/bigger_bot_0.3-sh_0.4",
+                            lines=1,
+                        )
+                        episode_input = gr.Textbox(
+                            label="Episode folder name  (as in H5 key)",
+                            placeholder='e.g. "1S7LAXRdDqK_0000000_plant_42_"',
+                            lines=1,
+                        )
+                        frame_input = gr.Number(
+                            label="Frame index  (0-based)",
+                            value=0,
+                            precision=0,
+                            minimum=0,
+                        )
+                        h5_instruction_input = gr.Textbox(
+                            label="Navigation Instruction",
+                            placeholder='e.g. "Go to the chair near the window"',
+                            lines=2,
+                        )
+                        h5_run_btn   = gr.Button("Run H5 Inference", variant="primary")
+                        h5_status    = gr.Textbox(label="Status", interactive=False, lines=2)
+
+                    with gr.Column(scale=3):
+                        h5_result_out = gr.Image(
+                            label="Frame  |  GT Heatmap  |  Predicted Costmap  |  Ranking Accuracy",
+                            type="numpy",
+                        )
+
+                h5_run_btn.click(
+                    fn=lambda h5p, bdir, ep, fr, instr: run_h5_inference(
+                        h5p, bdir, ep, fr, instr, checkpoint_path, device
+                    ),
+                    inputs=[h5_path_input, h5_base_dir_input, episode_input, frame_input, h5_instruction_input],
+                    outputs=[h5_result_out, h5_status],
+                    api_name=False,
                 )
 
-        run_btn.click(
-            fn=lambda img, masks, txt: run_inference(img, masks, txt, checkpoint_path, device),
-            inputs=[image_input, masks_input, instruction_input],
-            outputs=[costmap_out, per_obj_out, attn_out, gt_diff_out, ranking_out, status_box],
-            api_name=False,
-        )
+                _H5  = "/data/ws/VLN-CE/controller/object_react/training/bigger_bot_0.3-sh_0.4/bigger_bot_0.3-sh_0.4_gt_topometric_e3d_masks_pls.h5"
+                _DIR = "/data/ws/VLN-CE/controller/object_react/training/bigger_bot_0.3-sh_0.4"
+                gr.Examples(
+                    examples=[
+                        [_H5, _DIR, "1S7LAXRdDqK_0000000_plant_42_", 0,
+                         "Walk towards the door at the end of the corridor"],
+                        [_H5, _DIR, "1S7LAXRdDqK_0000000_plant_42_", 5,
+                         "Go to the chair near the window"],
+                        [_H5, _DIR, "1S7LAXRdDqK_0003399_chair_44_", 0,
+                         "Navigate to the chair"],
+                    ],
+                    inputs=[h5_path_input, h5_base_dir_input, episode_input, frame_input, h5_instruction_input],
+                    label="Example H5 queries",
+                )
+            # ----------------------------------------------------------------
+            # Tab 2 — standard image + masks .npy inference
+            # ----------------------------------------------------------------
+            with gr.Tab("VLN-CE dataset Demo"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        image_input = gr.Image(
+                            type="pil",
+                            label="Scene Image (RGB)",
+                            height=320,
+                        )
+                        masks_input = gr.Textbox(
+                            label="Masks file path  (.npy, shape [K, H, W])",
+                            placeholder="/path/to/masks.npy",
+                            lines=1,
+                        )
+                        instruction_input = gr.Textbox(
+                            label="Navigation Instruction",
+                            placeholder='e.g. "Go to the lamp on the nightstand"',
+                            lines=2,
+                        )
+                        run_btn = gr.Button("Run Inference", variant="primary")
+                        status_box = gr.Textbox(label="Status", interactive=False, lines=1)
 
-        gr.Examples(
-            examples=[
-                [None, "masks.npy", "Go to the lamp on the nightstand"],
-                [None, "masks.npy", "Navigate to the chair near the window"],
-                [None, "masks.npy", "Move towards the door at the end of the hallway"],
-            ],
-            inputs=[image_input, masks_input, instruction_input],
-            label="Example Instructions (supply your own image + masks path)",
-        )
+                    with gr.Column(scale=2):
+                        gt_diff_out = gr.Image(
+                            label="GT vs Predicted Distances  (geodesic_distances.npy)",
+                            type="numpy",
+                        )
+                        ranking_out = gr.Image(
+                            label="GT vs Predicted Ranking Comparison",
+                            type="numpy",
+                        )
+                        costmap_out = gr.Image(
+                            label="Costmap Visualization",
+                            type="numpy",
+                        )
+                        per_obj_out = gr.Image(
+                            label="Per-Object Distance Chart",
+                            type="numpy",
+                        )
+                        attn_out = gr.Image(
+                            label="Cross-Attention Map",
+                            type="numpy",
+                        )
+
+                run_btn.click(
+                    fn=lambda img, masks, txt: run_inference(img, masks, txt, checkpoint_path, device),
+                    inputs=[image_input, masks_input, instruction_input],
+                    outputs=[costmap_out, per_obj_out, attn_out, gt_diff_out, ranking_out, status_box],
+                    api_name=False,
+                )
+
+                gr.Examples(
+                    examples=[
+                        [None, "masks.npy", "Go to the lamp on the nightstand"],
+                        [None, "masks.npy", "Navigate to the chair near the window"],
+                        [None, "masks.npy", "Move towards the door at the end of the hallway"],
+                    ],
+                    inputs=[image_input, masks_input, instruction_input],
+                    label="Example Instructions (supply your own image + masks path)",
+                )
+
+            
 
     demo.launch(share=share, show_api=False)
+
 
 
 # ---------------------------------------------------------------------------

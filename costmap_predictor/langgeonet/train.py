@@ -62,6 +62,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+def _resume_from_checkpoint(
+    resume: str | None,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler,
+    device: torch.device,
+) -> tuple[int, float]:
+    """
+    Load a checkpoint and restore model, optimizer, and scheduler state.
+
+    Returns
+    -------
+    start_epoch : int   – first epoch to run (0-based)
+    best_mae    : float – best validation MAE seen so far
+    """
+    if not resume:
+        return 0, float("inf")
+
+    if not os.path.isfile(resume):
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
+
+    logger.info(f"Resuming from checkpoint: {resume}")
+    ckpt = torch.load(resume, map_location=device)
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    logger.info("  ✔ model weights loaded")
+
+    if "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        logger.info("  ✔ optimizer state loaded")
+
+    if "scheduler_state_dict" in ckpt and scheduler is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        logger.info("  ✔ scheduler state loaded")
+
+    start_epoch = int(ckpt.get("epoch", 0))          # checkpoint stores completed epoch count
+    best_mae    = float(ckpt.get("best_val_mae", float("inf")))
+    logger.info(f"  ↳ Resuming at epoch {start_epoch + 1}, best MAE so far = {best_mae:.4f}")
+    return start_epoch, best_mae
+
+
 # -------------------------------------------------------
 # Experiment Directories
 # -------------------------------------------------------
@@ -595,6 +636,7 @@ def train(
     lambda_rank=0.5, lambda_si=0.3,
     # Misc
     num_workers=4, seed=42, patience=10, device=None,
+    resume: str | None = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -641,14 +683,14 @@ def train(
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     criterion = LangGeoNetLoss(lambda_rank, lambda_si)
 
-    # --- Loop ---
-    best_mae = float("inf")
+    # --- Resume ---
+    start_epoch, best_mae = _resume_from_checkpoint(resume, model, optimizer, scheduler, device)
     wait = 0
     history = []
 
     logger.info(f"Training: {epochs} epochs, bs={batch_size}, accum={grad_accum}, device={device}")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         t0 = time.time()
         logger.info(f"\n{'='*60}\nEpoch {epoch+1}/{epochs}\n{'='*60}")
 
@@ -749,6 +791,7 @@ def train_h5(
     # Misc
     num_workers: int = 4, seed: int = 42, patience: int = 10,
     device=None,
+    resume: str | None = None,
 ):
     """
     Training loop backed by H5MaskPLSDataset.
@@ -888,17 +931,18 @@ def train_h5(
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     criterion = LangGeoNetLoss(lambda_rank, lambda_si)
 
-    best_mae    = float("inf")
+    # --- Resume ---
+    start_epoch, best_mae = _resume_from_checkpoint(resume, model, optimizer, scheduler, device)
     wait        = 0
     history     = []
-    global_step = 0
+    global_step = start_epoch * len(train_loader)   # approximate batch step offset
 
     logger.info(
         f"H5 training: {epochs} epochs, bs={batch_size}, "
         f"accum={grad_accum}, device={device} | exp_dir={exp_dir}"
     )
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         t0 = time.time()
         logger.info(f"\n{'='*60}\nEpoch {epoch+1}/{epochs}\n{'='*60}")
 
@@ -1040,6 +1084,8 @@ if __name__ == "__main__":
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", default=None)
+    p.add_argument("--resume", default=None,
+                   help="Path to a checkpoint (.pt) to resume training from")
     a = p.parse_args()
 
     shared = dict(
@@ -1050,6 +1096,7 @@ if __name__ == "__main__":
         grad_accum=a.grad_accum,
         lambda_rank=a.lambda_rank, lambda_si=a.lambda_si,
         patience=a.patience, num_workers=a.num_workers, device=a.device,
+        resume=a.resume,
     )
 
     if a.mode == "h5":

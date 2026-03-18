@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from transformers import CLIPProcessor  # ← removed BertTokenizer
 
-from .model import LangGeoNet
+from model import LangGeoNet
 
 
 class LangGeoNetPredictor:
@@ -162,6 +162,115 @@ class LangGeoNetPredictor:
             })
 
         return instruction, results
+
+    # ----------------------------------------------------------
+    # H5 inference
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _decode_rle_mask(rle: np.ndarray, H: int, W: int) -> np.ndarray:
+        """
+        Decode a 1-D F-major alternating skip/set RLE into a (H, W) bool array.
+
+        Runs at even positions (0, 2, …) are background (skip);
+        runs at odd positions (1, 3, …) are foreground (set).
+        """
+        flat = np.zeros(H * W, dtype=bool)
+        pos  = 0
+        for i, count in enumerate(rle):
+            if i % 2 == 1:
+                flat[pos: pos + count] = True
+            pos += count
+        return np.reshape(flat, (H, W), order="F")
+
+    @torch.no_grad()
+    def predict_from_h5(
+        self,
+        h5_path: str,
+        episode_id: str,
+        frame_idx: int,
+        instruction: str,
+        base_dir: str = None,
+    ):
+        """
+        Load a single frame directly from an HDF5 file and run inference.
+
+        HDF5 key format : ``{episode_id}_{frame_idx}``
+        RGB image path  : ``{base_dir}/trajectories/{episode_id}/images/{frame_idx:05d}.png``
+
+        ``base_dir`` defaults to the directory that contains the H5 file.
+
+        Args:
+            h5_path    : path to the HDF5 costmap file.
+            episode_id : episode folder name as it appears in the H5 key
+                         (e.g. ``"1S7LAXRdDqK_0000000_plant_42_"``).
+            frame_idx  : 0-based frame index within the episode.
+            instruction: navigation instruction string.
+            base_dir   : root directory that contains the ``trajectories/``
+                         sub-folder.  Defaults to the H5 file's parent dir.
+
+        Returns:
+            image_pil      : PIL.Image (RGB)
+            masks          : np.ndarray [K_valid, H, W]  bool
+            pred_distances : np.ndarray [K_valid]  model predictions in [0, 1]
+            gt_distances   : np.ndarray [K_valid]  GT PL scores normalised to [0, 1]
+            costmap        : np.ndarray [H, W]
+            attn_map       : np.ndarray [K_valid, L_content] or None
+        """
+        import h5py
+
+        ep_folder = episode_id
+        h5_key    = f"{ep_folder}_{frame_idx}"
+
+        with h5py.File(h5_path, "r") as h5:
+            if h5_key not in h5:
+                available = sorted(h5.keys())[:10]
+                raise KeyError(
+                    f"Key '{h5_key}' not found in {h5_path}. "
+                    f"First available keys: {available}"
+                )
+            grp  = h5[h5_key]
+            H, W = int(grp["size"][0]), int(grp["size"][1])
+
+            # Decode RLE masks
+            masks_grp = grp["img_masks"]
+            n_masks   = len(masks_grp)
+            masks_raw = np.stack(
+                [self._decode_rle_mask(masks_grp[str(i)][()], H, W)
+                 for i in range(n_masks)],
+                axis=0,
+            )  # [K, H, W]  bool
+
+            # GT PL scores — min-max normalise per frame
+            pls = grp["img_pls"][()].astype(np.float32)  # [K]
+
+        pls_min, pls_max = float(pls.min()), float(pls.max())
+        if pls_max - pls_min > 1e-6:
+            gt_distances_raw = (pls - pls_min) / (pls_max - pls_min)
+        else:
+            gt_distances_raw = np.zeros_like(pls)
+
+        # Locate RGB image: {base_dir}/trajectories/{ep_folder}/images/{frame:05d}.png
+        if base_dir is None:
+            base_dir = os.path.dirname(os.path.abspath(h5_path))
+        img_path = os.path.join(
+            base_dir, "trajectories", ep_folder, "images", f"{frame_idx:05d}.png"
+        )
+        if not os.path.isfile(img_path):
+            raise FileNotFoundError(f"RGB image not found: {img_path}")
+        image_pil = Image.open(img_path).convert("RGB")
+
+        # Run inference (predict_frame filters empty masks internally)
+        pred_distances, costmap, attn_map = self.predict_frame(
+            image_pil, masks_raw, instruction
+        )
+
+        # Align GT with the same valid-mask filter used inside predict_frame
+        valid        = masks_raw.any(axis=(1, 2))
+        gt_distances = gt_distances_raw[valid]
+        masks_valid  = masks_raw[valid]
+
+        return image_pil, masks_valid, pred_distances, gt_distances, costmap, attn_map
 
     # ----------------------------------------------------------
     # Batch prediction
