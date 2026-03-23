@@ -96,43 +96,62 @@ def _build_insta_maps(semantic_scene):
 
 def _get_masks_from_semantic(semantic, instaIdx2catIdx, instaIdx2catName,
                              filterInstaIDs=None):
-    """
-    Lightweight re-implementation of getMasksDictFromSemSensor.
-    Returns a list of dicts, one per unique foreground instance, each with:
-        'segmentation'  : (H,W) bool
-        'instance_id'   : int
-        'category_id'   : int
-        'category_name' : str
-    """
-    if filterInstaIDs is None:
-        filterInstaIDs = [0]
+    # """
+    # Lightweight re-implementation of getMasksDictFromSemSensor.
+    # Returns a list of dicts, one per unique foreground instance, each with:
+    #     'segmentation'  : (H,W) bool
+    #     'instance_id'   : int
+    #     'category_id'   : int
+    #     'category_name' : str
+    # """
+    # if filterInstaIDs is None:
+    #     filterInstaIDs = [0]
 
-    H, W = semantic.shape
-    unique_ids = [int(uid) for uid in np.unique(semantic)
-                  if int(uid) not in filterInstaIDs]
+    # H, W = semantic.shape
+    # unique_ids = [int(uid) for uid in np.unique(semantic)
+    #               if int(uid) not in filterInstaIDs]
 
-    # build quick look-ups
-    catIdx_map  = {}
-    catName_map = {}
-    if instaIdx2catIdx is not None:
-        for row in instaIdx2catIdx:
-            catIdx_map[int(row[0])] = int(row[1])
-    if instaIdx2catName is not None:
-        for row in instaIdx2catName:
-            catName_map[int(row[0])] = str(row[1])
+    # # build quick look-ups
+    # catIdx_map  = {}
+    # catName_map = {}
+    # if instaIdx2catIdx is not None:
+    #     for row in instaIdx2catIdx:
+    #         catIdx_map[int(row[0])] = int(row[1])
+    # if instaIdx2catName is not None:
+    #     for row in instaIdx2catName:
+    #         catName_map[int(row[0])] = str(row[1])
 
-    mask_dicts = []
-    for uid in unique_ids:
-        mask = (semantic == uid)
-        if not mask.any():
+    # mask_dicts = []
+    # for uid in unique_ids:
+    #     mask = (semantic == uid)
+    #     if not mask.any():
+    #         continue
+    #     mask_dicts.append({
+    #         'segmentation':  mask,
+    #         'instance_id':   uid,
+    #         'category_id':   catIdx_map.get(uid, -1),
+    #         'category_name': catName_map.get(uid, 'unknown'),
+    #     })
+    areaThresh= np.ceil(0.001 * semantic.shape[0] * semantic.shape[1])
+    instaIds = np.unique(semantic)
+    masks = semantic[None,:,:] == instaIds[:, None, None]
+    maskDicts = []
+    for i in range(masks.shape[0]):
+        area = np.sum(masks[i])
+        if area <= areaThresh:
             continue
-        mask_dicts.append({
-            'segmentation':  mask,
-            'instance_id':   uid,
-            'category_id':   catIdx_map.get(uid, -1),
-            'category_name': catName_map.get(uid, 'unknown'),
+        if filterInstaIDs is not None and instaIds[i] in filterInstaIDs:
+            continue
+        maskDicts.append({
+            'area': area,
+            'bbox': cv2.boundingRect(masks[i].astype(np.uint8)),
+            'instance_id': instaIds[i],
+            'category_id': instaIdx2catIdx[instaIds[i],1] if instaIdx2catIdx is not None else None,
+            'category_name': str(instaIdx2catName[instaIds[i],1]) if instaIdx2catName is not None else None,
+            'segmentation': masks[i],
+            'coords': np.array(np.nonzero(masks[i])).mean(1)[::-1].astype(int)
         })
-    return mask_dicts
+    return maskDicts
 
 
 # ---------------------------------------------------------------------------
@@ -366,9 +385,8 @@ def episode_generator(env, data_root, num_episodes: int = 10):
 
                     p3d_c, p3d_w, p_w_nav, instances, inds, pointsAll, pls_intra = points_data
 
-                    # align mask_dicts with detected instances
-                    # get_navigable_points_on_instances may return a subset of
-                    # visible instances; use detected instances list as ground truth
+                    assert(len(mask_dicts) == len(instances))
+
                     mask_dicts_aligned = []
                     filtered_instances = []
                     for inst_id in instances:
@@ -525,6 +543,14 @@ def episode_generator(env, data_root, num_episodes: int = 10):
                 'height':     height,
                 'hfov':       hfov,
             }
+            precompute_allPathsLengths= True
+
+            if precompute_allPathsLengths:
+                print("  precomputing all-pairs shortest paths lengths...", end="")
+                all_paths_lengths = dict(nx.all_pairs_dijkstra_path_length(G, weight='e3d'))
+                all_paths_lengths = np.array([[all_paths_lengths[src].get(tgt, 1e6) for tgt in G.nodes()] for src in G.nodes()])
+                all_paths_lengths= np.nan_to_num(all_paths_lengths, nan=1e6, posinf=1e6, neginf=1e6)
+                G.graph['all_paths_lengths'] = all_paths_lengths
 
             print(
                 f"  episode {episode_id}: {G.number_of_nodes()} nodes, "
