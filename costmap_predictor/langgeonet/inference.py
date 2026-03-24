@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from transformers import CLIPProcessor  # ← removed BertTokenizer
 
-from model import LangGeoNet
+from .model import LangGeoNet
 
 
 class LangGeoNetPredictor:

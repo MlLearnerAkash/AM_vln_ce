@@ -84,7 +84,7 @@ def _resume_from_checkpoint(
         raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
 
     logger.info(f"Resuming from checkpoint: {resume}")
-    ckpt = torch.load(resume, map_location=device)
+    ckpt = torch.load(resume, map_location=device, weights_only= False)
 
     model.load_state_dict(ckpt["model_state_dict"])
     logger.info("  ✔ model weights loaded")
@@ -638,6 +638,16 @@ def train(
     num_workers=4, seed=42, patience=10, device=None,
     resume: str | None = None,
 ):
+    wandb.init(
+        project="langgeonet",
+        name= "vlnce",
+        config={
+            "d_model": d_model,
+            "n_heads": n_heads,
+            "n_layers": n_layers,
+            "epochs": epochs
+        }
+    )
     torch.manual_seed(seed)
     np.random.seed(seed)
     if device is None:
@@ -747,10 +757,28 @@ def train(
             "optimizer_state_dict": optimizer.state_dict(),
             "best_val_mae": best_mae,
         }, os.path.join(output_dir, "latest_model.pt"))
-
+    
         if wait >= patience:
             logger.info(f"\nEarly stopping at epoch {epoch+1}.")
             break
+        wandb.log({
+                "train/total_loss": train_loss['loss_total'],
+                "train/regression_loss": train_loss['loss_regression'],
+                "train/ranking_loss": train_loss['loss_ranking'],
+                "train/scale_invariant_loss": train_loss['loss_scale_invariant'],
+                "epoch": epoch
+            })
+        wandb.log({
+                "val/MAE": val_m['mae'],
+                "val/RMSE": val_m['rmse'],
+                "val/RankAcc": val_m['ranking_accuracy'],
+                "val/Spearman": val_m['spearman'],
+                "val/acc@0.05": val_m['acc@0.05'],
+                "val/acc@0.10": val_m['acc@0.1'],
+                "val/acc@0.20": val_m['acc@0.2'],
+                "epoch": epoch
+            })
+        
 
     with open(os.path.join(output_dir, "history.json"), "w") as f:
         json.dump(history, f, indent=2, default=str)

@@ -543,6 +543,130 @@ def get_hm3d_scene_name_from_episode_path(path_episode, path_scenes_root_hm3d):
 
 
 
+# def visualize_segmentation_with_e3d(
+#     rgb: np.ndarray,
+#     mask_dicts: List[Dict],
+#     instances: List[int],
+#     pls_intra: np.ndarray,
+#     instance_id_dict: Dict,
+#     alpha: float = 0.45,
+#     show_e3d: bool = True,
+#     show_instance_ids: bool = True,
+#     colormap: str = "tab20",
+# ) -> np.ndarray:
+
+#     H, W = rgb.shape[:2]
+#     vis = rgb.copy().astype(np.float32)
+
+#     n = len(mask_dicts)
+#     if n == 0:
+#         return rgb.copy()
+
+#     # ── assign a unique color per instance ──────────────────────────────────
+#     cmap = cm.get_cmap(colormap, max(n, 1))
+#     colors = [(np.array(cmap(i)[:3]) * 255).astype(np.uint8) for i in range(n)]
+
+#     # ── 1. colored mask overlay ──────────────────────────────────────────────
+#     overlay = vis.copy()
+#     centroids = []  # pixel centroids for label/line placement
+
+#     for j, (md, color) in enumerate(zip(mask_dicts, colors)):
+#         seg = md["segmentation"]  # (H, W) bool
+
+#         if seg.shape != (H, W):
+#             seg = cv2.resize(
+#                 seg.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+#             ).astype(bool)
+
+#         overlay[seg] = (
+#             alpha * color.astype(np.float32)
+#             + (1 - alpha) * overlay[seg]
+#         )
+
+#         # centroid in pixel space
+#         ys, xs = np.where(seg)
+#         if len(xs) > 0:
+#             cx, cy = int(xs.mean()), int(ys.mean())
+#         else:
+#             cx, cy = W // 2, H // 2
+#         centroids.append((cx, cy))
+
+#     vis = overlay.astype(np.uint8)
+
+#     # ── 2. e3d distance lines between instance pairs ─────────────────────────
+#     if show_e3d and n > 1:
+#         # normalise e3d values for colour mapping (red=far, green=close)
+#         e3d_vals = []
+#         pairs = []
+#         for j in range(n):
+#             for k in range(j + 1, n):
+#                 inst_j = instances[j]
+#                 inst_k = instances[k]
+#                 c_j = np.array(
+#                     instance_id_dict.get(inst_j, {}).get("obb_center", np.zeros(3))
+#                 )
+#                 c_k = np.array(
+#                     instance_id_dict.get(inst_k, {}).get("obb_center", np.zeros(3))
+#                 )
+#                 e3d = float(np.linalg.norm(c_j - c_k))
+#                 e3d_vals.append(e3d)
+#                 pairs.append((j, k, e3d))
+
+#         e3d_min = min(e3d_vals) if e3d_vals else 0.0
+#         e3d_max = max(e3d_vals) if e3d_vals else 1.0
+#         e3d_range = e3d_max - e3d_min if e3d_max != e3d_min else 1.0
+
+#         for j, k, e3d in pairs:
+#             # normalised distance → color: green (close) → red (far)
+#             t = (e3d - e3d_min) / e3d_range          # 0.0 (close) … 1.0 (far)
+#             line_color = (
+#                 int(255 * t),        # R
+#                 int(255 * (1 - t)),  # G
+#                 0,                   # B
+#             )
+#             pt1 = centroids[j]
+#             pt2 = centroids[k]
+#             cv2.line(vis, pt1, pt2, line_color, thickness=1, lineType=cv2.LINE_AA)
+
+#             # label midpoint with e3d value
+#             mid_x = (pt1[0] + pt2[0]) // 2
+#             mid_y = (pt1[1] + pt2[1]) // 2
+#             cv2.putText(
+#                 vis, f"{e3d:.2f}m",
+#                 (mid_x, mid_y),
+#                 cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+#                 (255, 255, 255), 1, cv2.LINE_AA,
+#             )
+
+#     # ── 3. instance labels ───────────────────────────────────────────────────
+#     if show_instance_ids:
+#         for j, (md, color) in enumerate(zip(mask_dicts, colors)):
+#             cx, cy = centroids[j]
+#             inst_id  = md.get("instance_id", "?")
+#             cat_name = md.get("category_name", "unk")
+#             label    = f"{cat_name}:{inst_id}"
+
+#             # dark background box for readability
+#             (tw, th), _ = cv2.getTextSize(
+#                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1
+#             )
+#             cv2.rectangle(
+#                 vis,
+#                 (cx - 2, cy - th - 4),
+#                 (cx + tw + 2, cy + 2),
+#                 (0, 0, 0), -1,
+#             )
+#             cv2.putText(
+#                 vis, label,
+#                 (cx, cy),
+#                 cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+#                 tuple(int(c) for c in color), 1, cv2.LINE_AA,
+#             )
+
+#     return vis
+
+
+
 def visualize_segmentation_with_e3d(
     rgb: np.ndarray,
     mask_dicts: List[Dict],
@@ -566,9 +690,40 @@ def visualize_segmentation_with_e3d(
     cmap = cm.get_cmap(colormap, max(n, 1))
     colors = [(np.array(cmap(i)[:3]) * 255).astype(np.uint8) for i in range(n)]
 
-    # ── 1. colored mask overlay ──────────────────────────────────────────────
+    # ── compute per-instance e3d costs ───────────────────────────────────────
+    # cost[j] = mean e3d distance from instance j to all other instances,
+    # then normalised to [0, 1] across the frame.
+    # For a single instance there are no pairs → cost is 0.
+    raw_costs = np.zeros(n, dtype=np.float32)
+
+    if n > 1:
+        for j in range(n):
+            dists = []
+            for k in range(n):
+                if k == j:
+                    continue
+                inst_j = instances[j]
+                inst_k = instances[k]
+                c_j = np.array(
+                    instance_id_dict.get(inst_j, {}).get("obb_center", np.zeros(3))
+                )
+                c_k = np.array(
+                    instance_id_dict.get(inst_k, {}).get("obb_center", np.zeros(3))
+                )
+                dists.append(float(np.linalg.norm(c_j - c_k)))
+            raw_costs[j] = float(np.mean(dists))
+
+    cost_min = raw_costs.min()
+    cost_max = raw_costs.max()
+    cost_range = (cost_max - cost_min) if cost_max != cost_min else 1.0
+    norm_costs = (raw_costs - cost_min) / cost_range   # [0, 1] per frame
+
+    # ── 1. colored mask overlay (alpha scaled by normalised cost) ────────────
+    # alpha_min ensures even zero-cost segments are still visible
+    alpha_min = 0.15
+    alpha_max = alpha  # original alpha acts as the ceiling
     overlay = vis.copy()
-    centroids = []  # pixel centroids for label/line placement
+    centroids = []
 
     for j, (md, color) in enumerate(zip(mask_dicts, colors)):
         seg = md["segmentation"]  # (H, W) bool
@@ -578,75 +733,63 @@ def visualize_segmentation_with_e3d(
                 seg.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
             ).astype(bool)
 
+        # scale overlay opacity by normalised cost
+        effective_alpha = alpha_min + norm_costs[j] * (alpha_max - alpha_min)
         overlay[seg] = (
-            alpha * color.astype(np.float32)
-            + (1 - alpha) * overlay[seg]
+            effective_alpha * color.astype(np.float32)
+            + (1 - effective_alpha) * overlay[seg]
         )
 
-        # centroid in pixel space
         ys, xs = np.where(seg)
-        if len(xs) > 0:
-            cx, cy = int(xs.mean()), int(ys.mean())
-        else:
-            cx, cy = W // 2, H // 2
+        cx, cy = (int(xs.mean()), int(ys.mean())) if len(xs) > 0 else (W // 2, H // 2)
         centroids.append((cx, cy))
 
     vis = overlay.astype(np.uint8)
 
     # ── 2. e3d distance lines between instance pairs ─────────────────────────
-    if show_e3d and n > 1:
-        # normalise e3d values for colour mapping (red=far, green=close)
-        e3d_vals = []
-        pairs = []
-        for j in range(n):
-            for k in range(j + 1, n):
-                inst_j = instances[j]
-                inst_k = instances[k]
-                c_j = np.array(
-                    instance_id_dict.get(inst_j, {}).get("obb_center", np.zeros(3))
-                )
-                c_k = np.array(
-                    instance_id_dict.get(inst_k, {}).get("obb_center", np.zeros(3))
-                )
-                e3d = float(np.linalg.norm(c_j - c_k))
-                e3d_vals.append(e3d)
-                pairs.append((j, k, e3d))
+    # if show_e3d and n > 1:
+    #     e3d_vals = []
+    #     pairs = []
+    #     for j in range(n):
+    #         for k in range(j + 1, n):
+    #             inst_j = instances[j]
+    #             inst_k = instances[k]
+    #             c_j = np.array(
+    #                 instance_id_dict.get(inst_j, {}).get("obb_center", np.zeros(3))
+    #             )
+    #             c_k = np.array(
+    #                 instance_id_dict.get(inst_k, {}).get("obb_center", np.zeros(3))
+    #             )
+    #             e3d = float(np.linalg.norm(c_j - c_k))
+    #             e3d_vals.append(e3d)
+    #             pairs.append((j, k, e3d))
 
-        e3d_min = min(e3d_vals) if e3d_vals else 0.0
-        e3d_max = max(e3d_vals) if e3d_vals else 1.0
-        e3d_range = e3d_max - e3d_min if e3d_max != e3d_min else 1.0
+    #     e3d_min = min(e3d_vals) if e3d_vals else 0.0
+    #     e3d_max = max(e3d_vals) if e3d_vals else 1.0
+    #     e3d_range = e3d_max - e3d_min if e3d_max != e3d_min else 1.0
 
-        for j, k, e3d in pairs:
-            # normalised distance → color: green (close) → red (far)
-            t = (e3d - e3d_min) / e3d_range          # 0.0 (close) … 1.0 (far)
-            line_color = (
-                int(255 * t),        # R
-                int(255 * (1 - t)),  # G
-                0,                   # B
-            )
-            pt1 = centroids[j]
-            pt2 = centroids[k]
-            cv2.line(vis, pt1, pt2, line_color, thickness=1, lineType=cv2.LINE_AA)
+    #     for j, k, e3d in pairs:
+    #         t = (e3d - e3d_min) / e3d_range
+    #         line_color = (int(255 * t), int(255 * (1 - t)), 0)
+    #         pt1, pt2 = centroids[j], centroids[k]
+    #         cv2.line(vis, pt1, pt2, line_color, thickness=1, lineType=cv2.LINE_AA)
+    #         mid_x = (pt1[0] + pt2[0]) // 2
+    #         mid_y = (pt1[1] + pt2[1]) // 2
+    #         cv2.putText(
+    #             vis, f"{e3d:.2f}m",
+    #             (mid_x, mid_y),
+    #             cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+    #             (255, 255, 255), 1, cv2.LINE_AA,
+    #         )
 
-            # label midpoint with e3d value
-            mid_x = (pt1[0] + pt2[0]) // 2
-            mid_y = (pt1[1] + pt2[1]) // 2
-            cv2.putText(
-                vis, f"{e3d:.2f}m",
-                (mid_x, mid_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                (255, 255, 255), 1, cv2.LINE_AA,
-            )
-
-    # ── 3. instance labels ───────────────────────────────────────────────────
+    # ── 3. instance labels (with normalised cost appended) ───────────────────
     if show_instance_ids:
         for j, (md, color) in enumerate(zip(mask_dicts, colors)):
             cx, cy = centroids[j]
             inst_id  = md.get("instance_id", "?")
             cat_name = md.get("category_name", "unk")
-            label    = f"{cat_name}:{inst_id}"
+            label    = f"{cat_name}:{inst_id} ({norm_costs[j]:.2f})"
 
-            # dark background box for readability
             (tw, th), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1
             )

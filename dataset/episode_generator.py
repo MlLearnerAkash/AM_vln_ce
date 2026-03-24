@@ -15,7 +15,7 @@ from habitat_extensions.utils import generate_video, observations_to_image
 from habitat.utils.visualizations.utils import append_text_to_image
 from vlnce_baselines.common.environments import VLNCEDaggerEnv
 from vlnce_baselines.config.default import get_config
-from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances, encode_normalized_distances_to_frame, save_norm_frame_heatmap
+from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances, encode_normalized_distances_to_frame, save_norm_frame_heatmap, encode_directional_cue_to_frame
 
 def make_semantic(semantic_obs):
     """Convert semantic IDs to RGB colors while preserving spatial layout"""
@@ -71,6 +71,9 @@ def episode_generator(env, num_episodes=10):
             norm_frames = []
             semantic_frames= []
             gt_actions = []
+            direction_cue_frames = []
+            direction_weight_maps = []
+            prev_semantic_frame = None
             for point in reference_path:
                 while not env._env.episode_over:
                     best_action = follower.get_next_action(point)
@@ -89,10 +92,18 @@ def episode_generator(env, num_episodes=10):
                         semantic_frame, distances
                     )
 
+                    # Apply next action
+                    next_action = follower.get_next_action(point)
+                    weight_map, cue_frame = encode_directional_cue_to_frame(
+                        semantic_frame, next_action if next_action is not None else best_action
+                    )
+
                     frames.append(frame)
                     norm_frames.append(norm_frame)
                     semantic_frames.append(semantic_frame)
                     gt_actions.append(best_action)
+                    direction_cue_frames.append(cue_frame)
+                    direction_weight_maps.append(weight_map)
 
                     if done:
                         break
@@ -107,6 +118,8 @@ def episode_generator(env, num_episodes=10):
                 "norm_frames": norm_frames,
                 "semantic_frames": semantic_frames,
                 "gt_actions": gt_actions,
+                "direction_cue_frames": direction_cue_frames,   # [N, H, W, 3] uint8
+                "direction_weight_maps": direction_weight_maps, # [N, H, W] float32
             }
 
             pbar.update()

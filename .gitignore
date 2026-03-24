@@ -149,3 +149,5 @@ reference_path_videos
 chkpt
 wandb
 dataset/semantics
+costmap_predictor/langtoposeq/checkpoints
+costmap_predictor/langtoposeq/logs

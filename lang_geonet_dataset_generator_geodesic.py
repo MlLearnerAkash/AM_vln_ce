@@ -39,7 +39,7 @@ import sys
 import numpy as np
 import tqdm
 from PIL import Image
-
+from dataset.episode_generator import episode_generator
 # ---------------------------------------------------------------------------
 # Offline helper: build per-frame labels from saved files
 # ---------------------------------------------------------------------------
@@ -165,68 +165,68 @@ def _save_frame_data(
 # Episode generator
 # ---------------------------------------------------------------------------
 
-def episode_generator(env, num_episodes: int = 10):
-    """
-    Drive *env* along each episode's reference path and yield per-episode data.
+# def episode_generator(env, num_episodes: int = 10):
+#     """
+#     Drive *env* along each episode's reference path and yield per-episode data.
 
-    Yields
-    ------
-    dict with keys:
-        episode_id   : str
-        instruction  : str
-        frames       : list of (H, W, 3) uint8  RGB images
-        distances    : list of dict {object_id: float}  raw geodesic distances
-        semantics    : list of (H, W) int32  semantic frames
-    """
-    from habitat_extensions.shortest_path_follower import ShortestPathFollowerCompat
-    from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances
+#     Yields
+#     ------
+#     dict with keys:
+#         episode_id   : str
+#         instruction  : str
+#         frames       : list of (H, W, 3) uint8  RGB images
+#         distances    : list of dict {object_id: float}  raw geodesic distances
+#         semantics    : list of (H, W) int32  semantic frames
+#     """
+#     from habitat_extensions.shortest_path_follower import ShortestPathFollowerCompat
+#     from reference_path_follower_utils.semanitc_handler import get_object_geodesic_distances
 
-    follower = ShortestPathFollowerCompat(
-        env._env.sim, goal_radius=0.5, return_one_hot=False
-    )
-    follower.mode = "geodesic_path"
+#     follower = ShortestPathFollowerCompat(
+#         env._env.sim, goal_radius=0.5, return_one_hot=False
+#     )
+#     follower.mode = "geodesic_path"
 
-    with tqdm.tqdm(total=num_episodes, desc="Collecting episodes") as pbar:
-        for _ in range(num_episodes):
-            obs = env.reset()
-            episode_id    = env.current_episode.episode_id
-            reference_path = env.current_episode.reference_path
-            instruction   = env.current_episode.instruction.instruction_text
+#     with tqdm.tqdm(total=num_episodes, desc="Collecting episodes") as pbar:
+#         for _ in range(num_episodes):
+#             obs = env.reset()
+#             episode_id    = env.current_episode.episode_id
+#             reference_path = env.current_episode.reference_path
+#             instruction   = env.current_episode.instruction.instruction_text
 
-            frames    = []
-            all_dists = []
-            semantics = []
+#             frames    = []
+#             all_dists = []
+#             semantics = []
 
-            for point in reference_path:
-                while not env._env.episode_over:
-                    best_action = follower.get_next_action(point)
-                    if best_action is None:
-                        break
+#             for point in reference_path:
+#                 while not env._env.episode_over:
+#                     best_action = follower.get_next_action(point)
+#                     if best_action is None:
+#                         break
 
-                    obs, _, done, _ = env.step(best_action)
+#                     obs, _, done, _ = env.step(best_action)
 
-                    rgb      = obs["rgb"]
-                    semantic = obs["semantic"]
-                    dists    = get_object_geodesic_distances(env, semantic)
+#                     rgb      = obs["rgb"]
+#                     semantic = obs["semantic"]
+#                     dists    = get_object_geodesic_distances(env, semantic)
 
-                    frames.append(rgb)
-                    all_dists.append(dists)
-                    semantics.append(semantic)
+#                     frames.append(rgb)
+#                     all_dists.append(dists)
+#                     semantics.append(semantic)
 
-                    if done:
-                        break
+#                     if done:
+#                         break
 
-                if env._env.episode_over:
-                    break
+#                 if env._env.episode_over:
+#                     break
 
-            yield {
-                "episode_id": episode_id,
-                "instruction": instruction,
-                "frames":      frames,
-                "distances":   all_dists,
-                "semantics":   semantics,
-            }
-            pbar.update()
+#             yield {
+#                 "episode_id": episode_id,
+#                 "instruction": instruction,
+#                 "frames":      frames,
+#                 "distances":   all_dists,
+#                 "semantics":   semantics,
+#             }
+#             pbar.update()
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +299,7 @@ def _run_online(
 
                 # per-frame files
                 for frame_idx, (rgb, dists, semantic) in enumerate(
-                    zip(ep_data["frames"], ep_data["distances"], ep_data["semantics"])
+                    zip(ep_data["frames"], ep_data["direction_weight_maps"], ep_data["semantic_frames"])
                 ):
                     frame_dir = os.path.join(ep_dir, f"frame_{frame_idx:03d}")
                     _save_frame_data(rgb, semantic, dists, frame_dir)
@@ -344,7 +344,7 @@ if __name__ == "__main__":
         help="Root output directory for the dataset",
     )
     p_on.add_argument(
-        "--num_episodes", type=int, default=1,
+        "--num_episodes", type=int, default=50,
         help="Number of episodes to collect",
     )
     p_on.add_argument(
