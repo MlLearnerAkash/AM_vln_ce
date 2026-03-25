@@ -60,24 +60,16 @@ import utils_sim_traj as ust
 from utils_sim import *
 from habitat_extensions.utils import generate_video, observations_to_image
 from habitat.utils.visualizations.utils import append_text_to_image
-# ---------------------------------------------------------------------------
-# Ensure object-rel-nav helpers are importable (for get_instance_id_to_all_dict
-# and mask_to_rle_numpy which live in object-rel-nav/libs/common/utils)
-# ---------------------------------------------------------------------------
+
+from utils.e3d_costmap_visualizer import show_frame_pathlengths_heatmap, create_side_by_side_video
 _ORN_LIBS = "/data/ws/object-rel-nav"
 if _ORN_LIBS not in sys.path:
     sys.path.insert(0, _ORN_LIBS)
 
 from libs.common.utils import get_instance_id_to_all_dict, mask_to_rle_numpy
 
-EXCLUDE_CATS = ["wall", "ceiling", "floor", "beam", "objects", "lighting", "column", "misc", "railing"]
+EXCLUDE_CATS = ["ceiling", "beam", "objects", "lighting", "column", "misc", "railing"]
 
-# ---------------------------------------------------------------------------
-# Helper: retrieve or compute mask dicts from a raw semantic observation.
-# Mirrors getMasksDictFromSemSensor used in create_sim_graph_topometric.
-# This function needs instaIdx2catIdx / instaIdx2catName maps which we build
-# once per episode from the semantic scene.
-# ---------------------------------------------------------------------------
 
 def _build_insta_maps(semantic_scene):
     """Return (instaIdx2catIdx, instaIdx2catName) arrays from a semantic scene."""
@@ -278,31 +270,7 @@ def _save_frame_data_e3d(
 # ---------------------------------------------------------------------------
 
 def episode_generator(env, data_root, num_episodes: int = 10):
-    """
-    Drive *env* along each episode's reference path.
 
-    At each step:
-      • Renders semantic + depth from the live simulator.
-      • Detects visible instances → creates graph nodes with intra-frame e3d
-        and geodesic edges (mirrors create_sim_graph_topometric).
-      • Collects per-frame k-channel data for saving.
-
-    After the episode ends, DA (loop-closure) edges are added.
-
-    Yields
-    ------
-    dict with keys:
-        episode_id     : str
-        instruction    : str
-        graph          : nx.Graph   (full topometric graph for the episode)
-        frame_data     : list of dicts, one per step:
-            frame_idx     : int
-            rgb           : (H, W, 3) uint8
-            masks         : [K, H, W] uint8
-            class_ids     : [K] int64
-            instance_ids  : [K] int64
-            e3d_distances : [K] float32
-    """
     from habitat_extensions.shortest_path_follower import ShortestPathFollowerCompat
     from habitat_sim.utils.common import quat_from_magnum
 
@@ -339,7 +307,7 @@ def episode_generator(env, data_root, num_episodes: int = 10):
             K_mat  = getK_fromParams(hfov, width, height)  # from utils_sim (star import)
 
             # ── graph initialisation ─────────────────────────────────────────
-            G             = nx.Graph()
+            G= nx.Graph()
             numNodesCurr  = 0
             temporalEdges = []
             frame_data    = []
@@ -377,7 +345,7 @@ def episode_generator(env, data_root, num_episodes: int = 10):
                     )
 
                     if points_data is None:
-                        print(f"  [warn] points_data is None at frame {frame_idx}, skipping.")
+                        print(f"[warn] points_data is None at frame {frame_idx}, skipping.")
                         if done:
                             break
                         frame_idx += 1
@@ -390,19 +358,6 @@ def episode_generator(env, data_root, num_episodes: int = 10):
                     mask_dicts_aligned = []
                     filtered_instances = []
                     for inst_id in instances:
-                        # matched = [m for m in mask_dicts if m['instance_id'] == inst_id]
-                        # if matched:
-                        #     mask_dicts_aligned.append(matched[0])
-                        # else:
-                        #     # construct a minimal dict if not in mask_dicts
-                        #     mask_blank = np.zeros((height, width), dtype=bool)
-                        #     mask_dicts_aligned.append({
-                        #         'segmentation':  mask_blank,
-                        #         'instance_id':   int(inst_id),
-                        #         'category_id':   -1,
-                        #         'category_name': 'unknown',
-                        #     })
-
                         matched = [m for m in mask_dicts if m['instance_id'] == inst_id]
                         if matched:
                             md = matched[0]
@@ -625,11 +580,15 @@ def _run_online(
                         output_dir=frame_dir,
                     )
 
+                video_path = os.path.join(ep_dir, "side_by_side.mp4")
+                create_side_by_side_video(ep_dir, output_path=video_path, fps=5)
+
                 fh_split.write(f"{episode_id}\n")
                 print(
                     f"  episode {episode_id}  {len(ep_data['frame_data'])} frames"
                     f"  graph saved → {graph_path}"
                 )
+
     finally:
         env.close()
 
