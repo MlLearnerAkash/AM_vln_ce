@@ -62,13 +62,15 @@ from habitat_extensions.utils import generate_video, observations_to_image
 from habitat.utils.visualizations.utils import append_text_to_image
 
 from utils.e3d_costmap_visualizer import show_frame_pathlengths_heatmap, create_side_by_side_video
+from utils.h5_writer import save_episode_to_hdf5
+
 _ORN_LIBS = "/data/ws/object-rel-nav"
 if _ORN_LIBS not in sys.path:
     sys.path.insert(0, _ORN_LIBS)
 
 from libs.common.utils import get_instance_id_to_all_dict, mask_to_rle_numpy
 
-EXCLUDE_CATS = ["ceiling", "beam", "objects", "lighting", "column", "misc", "railing"]
+EXCLUDE_CATS = ["ceiling", "beam", "objects", "lighting", "column", "misc", "railing", "floor"] #
 
 
 def _build_insta_maps(semantic_scene):
@@ -88,42 +90,6 @@ def _build_insta_maps(semantic_scene):
 
 def _get_masks_from_semantic(semantic, instaIdx2catIdx, instaIdx2catName,
                              filterInstaIDs=None):
-    # """
-    # Lightweight re-implementation of getMasksDictFromSemSensor.
-    # Returns a list of dicts, one per unique foreground instance, each with:
-    #     'segmentation'  : (H,W) bool
-    #     'instance_id'   : int
-    #     'category_id'   : int
-    #     'category_name' : str
-    # """
-    # if filterInstaIDs is None:
-    #     filterInstaIDs = [0]
-
-    # H, W = semantic.shape
-    # unique_ids = [int(uid) for uid in np.unique(semantic)
-    #               if int(uid) not in filterInstaIDs]
-
-    # # build quick look-ups
-    # catIdx_map  = {}
-    # catName_map = {}
-    # if instaIdx2catIdx is not None:
-    #     for row in instaIdx2catIdx:
-    #         catIdx_map[int(row[0])] = int(row[1])
-    # if instaIdx2catName is not None:
-    #     for row in instaIdx2catName:
-    #         catName_map[int(row[0])] = str(row[1])
-
-    # mask_dicts = []
-    # for uid in unique_ids:
-    #     mask = (semantic == uid)
-    #     if not mask.any():
-    #         continue
-    #     mask_dicts.append({
-    #         'segmentation':  mask,
-    #         'instance_id':   uid,
-    #         'category_id':   catIdx_map.get(uid, -1),
-    #         'category_name': catName_map.get(uid, 'unknown'),
-    #     })
     areaThresh= np.ceil(0.001 * semantic.shape[0] * semantic.shape[1])
     instaIds = np.unique(semantic)
     masks = semantic[None,:,:] == instaIds[:, None, None]
@@ -554,6 +520,8 @@ def _run_online(
     split_file = os.path.join(data_root, f"{split}.txt")
 
     env = VLNCEDaggerEnv(config=config)
+    HDF5_PATH = os.path.join(data_root, f"{split}.h5")
+
     try:
         with open(split_file, "w") as fh_split:
             for ep_data in episode_generator(env, data_root, num_episodes=num_episodes):
@@ -566,28 +534,34 @@ def _run_online(
                     fh.write(ep_data["instruction"])
 
                 # episode graph
-                graph_path = os.path.join(ep_dir, "episode_graph.pickle")
-                with open(graph_path, "wb") as fh:
-                    pickle.dump(ep_data["graph"], fh)
+                # graph_path = os.path.join(ep_dir, "episode_graph.pickle")
+                # with open(graph_path, "wb") as fh:
+                #     pickle.dump(ep_data["graph"], fh)
 
                 # per-frame files
-                for fd in ep_data["frame_data"]:
-                    frame_dir = os.path.join(ep_dir, f"frame_{fd['frame_idx']:03d}")
-                    _save_frame_data_e3d(
-                        rgb=fd["rgb"],
-                        mask_dicts=fd["mask_dicts"],
-                        instance_id_dict=fd["instance_id_dict"],
-                        output_dir=frame_dir,
-                    )
+                # for fd in ep_data["frame_data"]:
+                #     frame_dir = os.path.join(ep_dir, f"frame_{fd['frame_idx']:03d}")
+                #     _save_frame_data_e3d(
+                #         rgb=fd["rgb"],
+                #         mask_dicts=fd["mask_dicts"],
+                #         instance_id_dict=fd["instance_id_dict"],
+                #         output_dir=frame_dir,
+                #     )
 
-                video_path = os.path.join(ep_dir, "side_by_side.mp4")
-                create_side_by_side_video(ep_dir, output_path=video_path, fps=5)
+                #NOTE: visualize costmap
+                # video_path = os.path.join(ep_dir, "side_by_side.mp4")
+                # create_side_by_side_video(ep_dir, output_path=video_path, fps=5)
 
                 fh_split.write(f"{episode_id}\n")
+                # print(
+                #     f"  episode {episode_id}  {len(ep_data['frame_data'])} frames"
+                #     f"  graph saved → {graph_path}"
+                # )
                 print(
-                    f"  episode {episode_id}  {len(ep_data['frame_data'])} frames"
-                    f"  graph saved → {graph_path}"
+                    f"  episode {ep_data['episode_id']}  "
+                    f"{len(ep_data['frame_data'])} frames  → {HDF5_PATH}"
                 )
+                save_episode_to_hdf5(HDF5_PATH, ep_data)
 
     finally:
         env.close()
@@ -616,7 +590,7 @@ if __name__ == "__main__":
         help="Root output directory for the dataset",
     )
     parser.add_argument(
-        "--num_episodes", type=int, default=1,
+        "--num_episodes", type=int, default=500,
         help="Number of episodes to collect",
     )
     parser.add_argument(
