@@ -520,7 +520,7 @@ def _run_online(
     split_file = os.path.join(data_root, f"{split}.txt")
 
     env = VLNCEDaggerEnv(config=config)
-    HDF5_PATH = os.path.join(data_root, f"{split}.h5")
+    HDF5_PATH = os.path.join(data_root, f"e3d_metric_{split}_ep500.h5")
 
     try:
         with open(split_file, "w") as fh_split:

@@ -1,39 +1,24 @@
-"""
-Dataset for LangGeoNet training.
-
-Each episode contains:
-    - Multiple RGB frames (the trajectory)
-    - One language instruction (shared across all frames in the episode)
-    - Per-frame instance segmentation masks + class IDs
-    - Per-object normalized geodesic distance to goal (ground truth)
-
-Expected directory structure:
-    data_root/
-        train.txt / val.txt          # episode IDs, one per line
-        episode_000/
-            instruction.txt           # language instruction
-            frame_000/
-                rgb.png               # RGB image
-                masks.npy             # [K, H, W] binary masks
-                class_ids.npy         # [K] integer class IDs
-                geodesic_distances.npy # [K] normalized geodesic distances
-            frame_001/
-                ...
-        episode_001/
-            ...
-"""
-
 import os
 import glob
 import json
 import numpy as np
 import h5py
 from PIL import Image
+from typing import NamedTuple
+import random
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import CLIPProcessor
+from utils.h5_writer import load_episode_from_hdf5
+from pycocotools import mask as mask_utils
+import torch
 
+
+class NodeEntry(NamedTuple):
+    node_id:  int
+    mask:     np.ndarray
+    path_row: np.ndarray
 
 class LangGeoNetDataset(Dataset):
     """
@@ -409,3 +394,148 @@ def create_h5_maskpls_dataloader(
         pin_memory=True,
         drop_last=shuffle,   # drop incomplete batches only during training
     )
+
+
+class H5EpisodePathLengthsDataset(Dataset):
+    def __init__(self, h5_path: str, episode_ids: list = None):
+        super().__init__()
+        self.h5_path= h5_path
+        self.clip_processor= CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+        self._cached_ep_id: str = None
+        self._cached_ep_data: dict= None
+
+        with h5py.File(h5_path, 'r') as hf:
+            all_keys = sorted(hf.keys())
+        self.episode_ids = episode_ids if episode_ids is not None else all_keys
+        #all_keys#episode_ids if episode_ids is not None else all_keys
+
+        self._ep_start = []
+        self._fr_local = []
+        self.episode_frame_counts = {}
+
+        for ep in self.episode_ids:
+            try:
+                ep_data= load_episode_from_hdf5(self.h5_path, ep)
+            except Exception:
+                continue
+            n_frames = len(ep_data['frame_data'])
+            self.episode_frame_counts[ep] = n_frames
+
+            for local_i, fd in enumerate(ep_data["frame_data"]):
+                self._ep_start.append(ep)
+                self._fr_local.append(local_i)
+
+    def __len__(self):
+        return len(self._ep_start)
+    
+    def _get_episode(self, ep_id: str) -> dict:
+        """Load episode only when it changes (cache the current one)."""
+        if self._cached_ep_id != ep_id:
+            self._cached_ep_data = load_episode_from_hdf5(self.h5_path, ep_id)
+            self._cached_ep_id = ep_id
+        return self._cached_ep_data
+    
+    def __getitem__(self, idx):
+        ep_id= self._ep_start[idx]
+        local_frame_idx = self._fr_local[idx]
+        ep_data = self._get_episode(ep_id)
+
+        G = ep_data['graph']
+        fd = ep_data['frame_data'][local_frame_idx]
+        frame_idx = int(fd['frame_idx'])
+
+        all_paths= G.graph.get("all_paths_lengths", None)
+        if all_paths is None:
+            raise KeyError(f"Episode {ep_id} missing 'all_paths_lengths'")
+
+        all_nodes = list(G.nodes())
+        node_to_idx = {n: i for i, n in enumerate(all_nodes)}
+        frame_node_ids = [n for n in all_nodes if G.nodes[n]['map'][0] == frame_idx]
+        indices = [node_to_idx[n] for n in frame_node_ids]
+
+        if indices:
+            path_rows = all_paths[np.ix_(indices, indices)].astype(np.float32)
+        else:
+            path_rows = np.zeros((0, 0), dtype=np.float32)
+
+        rgb = fd['rgb']
+        H, W = rgb.shape[:2]
+
+        masks_list = []
+        for n in frame_node_ids:
+            rle = G.nodes[n].get('segmentation')
+            if rle is None:
+                masks_list.append(np.zeros((H, W), dtype=bool))
+                continue
+            try:
+                if 'size' not in rle:
+                    rle = {'size': [H, W], 'counts': rle['counts']}
+                comp = mask_utils.frPyObjects(rle, rle['size'][0], rle['size'][1])
+                dec = mask_utils.decode(comp)
+                m = (dec[..., 0] if dec.ndim == 3 else dec).astype(bool)
+            except Exception:
+                m = np.zeros((H, W), dtype=bool)
+            masks_list.append(m)
+
+        masks_arr = np.stack(masks_list) if masks_list else np.zeros((0, H, W), dtype=bool)
+        node_registry = {
+        node_id: NodeEntry(
+            node_id  = node_id,
+            mask     = masks_arr[k],
+            path_row = path_rows[k],
+        )
+        for k, node_id in enumerate(frame_node_ids)
+        }
+
+        clip_text = self.clip_processor(
+        text=ep_data.get('instruction', ''),
+        padding='max_length', truncation=True,
+        max_length=77, return_tensors='pt',
+        )
+
+        return {
+        'episode_id':     ep_id,
+        'frame_idx':      frame_idx,
+        'frame_rgb':      rgb,
+        "node_registry":  node_registry,
+        "frame_node_ids":  frame_node_ids,
+        'input_ids':      clip_text['input_ids'].squeeze(0),
+        'attention_mask': clip_text['attention_mask'].squeeze(0),
+        'node_to_idx':    node_to_idx, 
+    }
+
+
+def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, shuffle: bool = False, num_workers: int = 0, val_split: float= 0.2, seed: int = 42,):
+    with h5py.File(h5_path, 'r') as hf:
+        all_keys = sorted(hf.keys())
+
+    # Shuffle and split at episode level
+    rng = random.Random(seed)
+    keys = list(all_keys)
+    rng.shuffle(keys)
+
+    split_idx = int(len(keys) * (1 - val_split))
+    train_ids = keys[:split_idx]
+    val_ids   = keys[split_idx:]
+
+    train_ds = H5EpisodePathLengthsDataset(h5_path, episode_ids=train_ids)
+    val_ds= H5EpisodePathLengthsDataset(h5_path, episode_ids= val_ids)
+    def h5_episode_pathlengths_collate_fn(batch: list[dict]) -> dict:
+        """Collate: stack token tensors, keep variable-length masks/path_rows as lists."""
+        return {
+            "input_ids":       torch.stack([b["input_ids"] for b in batch]),
+            "attention_mask":  torch.stack([b["attention_mask"] for b in batch]),
+            "frame_rgbs":      [b["frame_rgb"] for b in batch],
+            "episode_ids":     [b["episode_id"] for b in batch],
+            "frame_idxs":      [b["frame_idx"] for b in batch],
+            "node_registries":  [b["node_registry"] for b in batch],
+            "node_to_idx":      [b["node_to_idx"] for b in batch],
+            "frame_node_ids":   [b["frame_node_ids"] for b in batch],
+        }
+    train_loader= DataLoader(train_ds, batch_size=batch_size,shuffle=shuffle,
+                             num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,
+                             pin_memory= True)
+    val_loader= DataLoader(val_ds, batch_size=batch_size,shuffle=shuffle,
+                             num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,
+                             pin_memory= True)
+    return train_loader, val_loader
