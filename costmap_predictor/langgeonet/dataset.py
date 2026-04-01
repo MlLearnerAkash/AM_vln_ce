@@ -395,6 +395,7 @@ def create_h5_maskpls_dataloader(
         drop_last=shuffle,   # drop incomplete batches only during training
     )
 
+#----------------------------------------xxxxxxxxxxxxxxx-----------------------------
 
 class H5EpisodePathLengthsDataset(Dataset):
     def __init__(self, h5_path: str, episode_ids: list = None):
@@ -406,24 +407,24 @@ class H5EpisodePathLengthsDataset(Dataset):
 
         with h5py.File(h5_path, 'r') as hf:
             all_keys = sorted(hf.keys())
-        self.episode_ids = episode_ids if episode_ids is not None else all_keys
-        #all_keys#episode_ids if episode_ids is not None else all_keys
+            self.episode_ids = episode_ids if episode_ids is not None else all_keys
+            #all_keys#episode_ids if episode_ids is not None else all_keys
 
-        self._ep_start = []
-        self._fr_local = []
-        self.episode_frame_counts = {}
+            self._ep_start = []
+            self._fr_local = []
+            self.episode_frame_counts = {}
 
-        for ep in self.episode_ids:
-            try:
-                ep_data= load_episode_from_hdf5(self.h5_path, ep)
-            except Exception:
-                continue
-            n_frames = len(ep_data['frame_data'])
-            self.episode_frame_counts[ep] = n_frames
+            for ep in self.episode_ids:
+                try:
+                    ep_data= load_episode_from_hdf5(self.h5_path, ep)
+                except Exception:
+                    continue
+                n_frames = len(ep_data['frame_data'])
+                self.episode_frame_counts[ep] = n_frames
 
-            for local_i, fd in enumerate(ep_data["frame_data"]):
-                self._ep_start.append(ep)
-                self._fr_local.append(local_i)
+                for local_i, fd in enumerate(ep_data["frame_data"]):
+                    self._ep_start.append(ep)
+                    self._fr_local.append(local_i)
 
     def __len__(self):
         return len(self._ep_start)
@@ -468,12 +469,53 @@ class H5EpisodePathLengthsDataset(Dataset):
                 masks_list.append(np.zeros((H, W), dtype=bool))
                 continue
             try:
+                # ── structural validation ──────────────────────────────────
+                if not isinstance(rle, dict) or 'counts' not in rle:
+                    raise ValueError(
+                        f"Node {n}: RLE missing 'counts' field. Got type={type(rle)}"
+                    )
                 if 'size' not in rle:
-                    rle = {'size': [H, W], 'counts': rle['counts']}
-                comp = mask_utils.frPyObjects(rle, rle['size'][0], rle['size'][1])
-                dec = mask_utils.decode(comp)
-                m = (dec[..., 0] if dec.ndim == 3 else dec).astype(bool)
-            except Exception:
+                    raise ValueError(
+                        f"Node {n}: RLE missing 'size' field. counts type={type(rle['counts'])}"
+                    )
+
+                counts = rle['counts']
+
+                # ── type coercion: pycocotools C code needs bytes, not str ─
+                if isinstance(counts, str):
+                    import warnings
+                    warnings.warn(
+                        f"Node {n}: RLE 'counts' is str, expected bytes — coercing. "
+                        f"This may indicate a serialisation bug in the dataset generator.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    counts = counts.encode('utf-8')
+                    rle = {'size': rle['size'], 'counts': counts}
+
+                # ── size mismatch: clamp to actual frame dims ─────────────
+                rle_h, rle_w = int(rle['size'][0]), int(rle['size'][1])
+                if rle_h != H or rle_w != W:
+                    import warnings
+                    warnings.warn(
+                        f"Node {n}: RLE size ({rle_h}×{rle_w}) != frame size "
+                        f"({H}×{W}). Overriding — mask may be incorrect.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    rle = {'size': [H, W], 'counts': counts}
+
+                # ── decode (list API is more robust than single-dict path) ─
+                comp = mask_utils.frPyObjects([rle], H, W)
+                dec  = mask_utils.decode(comp)
+                m    = (dec[..., 0] if dec.ndim == 3 else dec).astype(bool)
+
+            except Exception as _rle_exc:
+                # Log the problem but never kill the training process.
+                import warnings
+                warnings.warn(
+                    f"Node {n}: mask decode failed — using zero mask. "
+                    f"Reason: {type(_rle_exc).__name__}: {_rle_exc}",
+                    RuntimeWarning, stacklevel=2,
+                )
                 m = np.zeros((H, W), dtype=bool)
             masks_list.append(m)
 
@@ -507,7 +549,7 @@ class H5EpisodePathLengthsDataset(Dataset):
 
 def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, shuffle: bool = False, num_workers: int = 0, val_split: float= 0.2, seed: int = 42,):
     with h5py.File(h5_path, 'r') as hf:
-        all_keys = sorted(hf.keys())
+        all_keys = sorted(hf.keys())#[:100]
 
     # Shuffle and split at episode level
     rng = random.Random(seed)

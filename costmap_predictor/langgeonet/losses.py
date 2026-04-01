@@ -68,15 +68,18 @@ class OrdinalRankingLoss(nn.Module):
             pair_losses = F.relu(pred_diff + self.margin)
             valid_losses = pair_losses[valid]
 
-            # Hard negative mining
-            n_hard = max(1, int(valid_losses.numel() * self.hard_fraction))
-            if valid_losses.numel() > n_hard:
-                topk, _ = valid_losses.topk(n_hard)
+            violated = valid_losses[valid_losses > 0]
+            if violated.numel() == 0:
+                continue
+            # Hard negative mining: topk over violated pairs only
+            n_hard = max(1, int(violated.numel() * self.hard_fraction))
+            if violated.numel() > n_hard:
+                topk, _ = violated.topk(n_hard)
                 total_loss += topk.sum()
                 total_pairs += n_hard
             else:
-                total_loss += valid_losses.sum()
-                total_pairs += valid_losses.numel()
+                total_loss += violated.sum()
+                total_pairs += violated.numel()
 
         if total_pairs == 0:
             return torch.tensor(0.0, device=predictions[0].device, requires_grad=True)
