@@ -529,6 +529,10 @@ class H5EpisodePathLengthsDataset(Dataset):
         for k, node_id in enumerate(frame_node_ids)
         }
 
+        pil_img = Image.fromarray(rgb.astype(np.uint8))
+        clip_img_out = self.clip_processor(images=pil_img, return_tensors='pt')
+        pixel_values = clip_img_out['pixel_values'].squeeze(0)
+
         clip_text = self.clip_processor(
         text=ep_data.get('instruction', ''),
         padding='max_length', truncation=True,
@@ -539,6 +543,7 @@ class H5EpisodePathLengthsDataset(Dataset):
         'episode_id':     ep_id,
         'frame_idx':      frame_idx,
         'frame_rgb':      rgb,
+        'pixel_values':   pixel_values,
         "node_registry":  node_registry,
         "frame_node_ids":  frame_node_ids,
         'input_ids':      clip_text['input_ids'].squeeze(0),
@@ -549,7 +554,7 @@ class H5EpisodePathLengthsDataset(Dataset):
 
 def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, shuffle: bool = False, num_workers: int = 0, val_split: float= 0.2, seed: int = 42,):
     with h5py.File(h5_path, 'r') as hf:
-        all_keys = sorted(hf.keys())#[:100]
+        all_keys = sorted(hf.keys())[:10]
 
     # Shuffle and split at episode level
     rng = random.Random(seed)
@@ -565,6 +570,7 @@ def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, 
     def h5_episode_pathlengths_collate_fn(batch: list[dict]) -> dict:
         """Collate: stack token tensors, keep variable-length masks/path_rows as lists."""
         return {
+            "pixel_values":    torch.stack([b["pixel_values"] for b in batch]),
             "input_ids":       torch.stack([b["input_ids"] for b in batch]),
             "attention_mask":  torch.stack([b["attention_mask"] for b in batch]),
             "frame_rgbs":      [b["frame_rgb"] for b in batch],
@@ -576,8 +582,8 @@ def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, 
         }
     train_loader= DataLoader(train_ds, batch_size=batch_size,shuffle=shuffle,
                              num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,
-                             pin_memory= True)
-    val_loader= DataLoader(val_ds, batch_size=batch_size,shuffle=shuffle,
+                             pin_memory=True, persistent_workers=(num_workers > 0))
+    val_loader= DataLoader(val_ds, batch_size=batch_size,shuffle=False,
                              num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,
-                             pin_memory= True)
+                             pin_memory=True, persistent_workers=(num_workers > 0))
     return train_loader, val_loader

@@ -170,25 +170,26 @@ class CrossModalTransformerLayer(nn.Module):
         Args:
             query:        [B, K, D] object tokens
             context:      [B, L, D] language tokens
-            query_mask:   [B, K] True = valid token
+            query_mask:   [B, K] True = valid token  (unused — no self-attn)
             context_mask: [B, L] True = valid token
 
         Returns:
             out:          [B, K, D] updated object tokens
             attn_weights: [B, K, L] cross-attention weights
+
+        NOTE: self-attention is intentionally disabled.
+        Self-attention between object tokens causes progressive representation
+        collapse: all K objects (which share the same frozen CLIP image context)
+        become near-identical after each layer (cosine-sim rises from 0.58 → 0.87
+        over 6 layers), killing per-object discriminability.
+        Objects only need to cross-attend to language for instruction grounding.
         """
-        q_pad = ~query_mask if query_mask is not None else None
         c_pad = ~context_mask if context_mask is not None else None
 
-        # Self-attention among objects
+        # Cross-attention only: each object independently attends to language
         residual = query
-        x, _ = self.self_attn(query, query, query, key_padding_mask=q_pad)
-        x = self.norm1(residual + self.drop1(x))
-
-        # Cross-attention: objects attend to language
-        residual = x
         x_cross, attn_weights = self.cross_attn(
-            x, context, context, key_padding_mask=c_pad
+            query, context, context, key_padding_mask=c_pad
         )
         x = self.norm2(residual + self.drop2(x_cross))
 
@@ -368,13 +369,6 @@ class LangGeoNet(nn.Module):
             x, attn_w = layer(x, lang_tokens, obj_mask, lang_mask)
             attn_weights_all.append(attn_w)
 
-        # --- Predict geodesic per object ---
-        # x contains language conditioning from cross-attention, but the language
-        # delta is approximately equal for all K objects (flat attention).
-        # We add an explicit per-object alignment score: the scaled dot product
-        # between each object's post-transformer feature and the global instruction
-        # vector. This is different for each object and gives the head an
-        # unambiguous instruction-discriminative signal.
         instr_proj = self.instr_align_proj(instr_vec)               # [B, d]
         align = torch.bmm(
             x, instr_proj.unsqueeze(-1)                             # [B, K, d] x [B, d, 1]

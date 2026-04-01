@@ -14,8 +14,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.stats import spearmanr
-from PIL import Image as PILImage
-from transformers import CLIPProcessor
 
 from model import build_langgeonet
 from dataset import create_h5_episode_pathlengths_dataloader
@@ -36,17 +34,12 @@ logger = logging.getLogger(__name__)
 # Batch adaptor  —  bridges dataloader → model interface
 # -------------------------------------------------------
 
-def _prepare_batch(batch: dict, clip_processor: CLIPProcessor, device: torch.device):
+def _prepare_batch(batch: dict, device: torch.device):
     """
     Convert a raw H5EpisodePathLengthsDataset batch into the tensors the
     model and loss expect.
     """
-
-
-    pil_images = [PILImage.fromarray(rgb.astype(np.uint8)) for rgb in batch["frame_rgbs"]]
-    clip_out   = clip_processor(images=pil_images, return_tensors="pt", padding=True)
-    pixel_values = clip_out["pixel_values"].to(device)
-
+    pixel_values = batch["pixel_values"].to(device)
     input_ids  = batch["input_ids"].to(device)
     attn_mask  = batch["attention_mask"].to(device)
 
@@ -284,7 +277,7 @@ def make_exp_dir(base_dir):
 # -------------------------------------------------------
 
 def train_one_epoch(model, loader, criterion, optimizer, device,
-                    clip_processor, grad_accum=1, wandb_run=None, global_step=0):
+                    grad_accum=1, wandb_run=None, global_step=0):
     model.train()
     losses      = defaultdict(float)
     n           = 0
@@ -292,7 +285,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 
     for i, batch in enumerate(loader):
         pixel_values, input_ids, attn_mask, masks_list, gts_list = \
-            _prepare_batch(batch, clip_processor, device)
+            _prepare_batch(batch, device)
         del batch 
         # skip frames where every registry was empty
         if all(m.shape[0] == 0 for m in masks_list):
@@ -317,14 +310,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 
         if (i + 1) % 50 == 0:
             logger.info(f"  batch {i+1}/{len(loader)}  loss={losses['loss_total']/n:.4f}")
-
+        break
 
     return {k: v / max(n, 1) for k, v in losses.items()}, global_step
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, clip_processor, 
-             wandb_run=None, exp_dir=None, epoch= None, max_viz=8):
+def validate(model, loader, criterion, device,
+             wandb_run=None, exp_dir=None, epoch=None, max_viz=8):
     model.eval()
     losses               = defaultdict(float)
     n                    = 0
@@ -334,7 +327,7 @@ def validate(model, loader, criterion, device, clip_processor,
     first_batch_vizd = False
     for batch in loader:
         pixel_values, input_ids, attn_mask, masks_list, gts_list = \
-            _prepare_batch(batch, clip_processor, device)
+            _prepare_batch(batch, device)
 
         if all(m.shape[0] == 0 for m in masks_list):
             del batch
@@ -371,6 +364,7 @@ def validate(model, loader, criterion, device, clip_processor,
                 except Exception as e:
                     print(f"Viz sample {i} failed: {e}")
             first_batch_vizd = True
+        break
 
     avg_losses = {k: v / max(n, 1) for k, v in losses.items()}
     metrics    = compute_metrics(all_preds, all_gts)
@@ -420,9 +414,6 @@ def train_h5(
     os.makedirs(ckpt_dir, exist_ok=True)
     analysis_dir = os.path.join(exp_dir, "analysis")
     os.makedirs(analysis_dir, exist_ok=True)
-
-    # CLIP processor lives here so we can call it in _prepare_batch
-    clip_processor = CLIPProcessor.from_pretrained(clip_model)
 
     logger.info("Building model...")
     model   = build_langgeonet(d_model, n_heads, n_layers, num_classes, clip_model).to(device)
@@ -494,9 +485,9 @@ def train_h5(
 
         train_loss, global_step = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            clip_processor, grad_accum, wandb_run, global_step,
+            grad_accum, wandb_run, global_step,
         )
-        val_m = validate(model, train_loader, criterion, device, clip_processor,
+        val_m = validate(model, train_loader, criterion, device,
                  wandb_run=wandb_run, exp_dir=analysis_dir, epoch=epoch + 1, max_viz=8)
         scheduler.step()
 
@@ -584,16 +575,16 @@ if __name__ == "__main__":
     p.add_argument("--wandb_run_name",default=None)
     p.add_argument("--no_wandb",      action="store_true")
     p.add_argument("--epochs",        type=int,   default=100)
-    p.add_argument("--batch_size",    type=int,   default=32)
+    p.add_argument("--batch_size",    type=int,   default=8)
     p.add_argument("--lr_head",       type=float, default=1e-3)
     p.add_argument("--lr_backbone",   type=float, default=1e-5)
     p.add_argument("--d_model",       type=int,   default=256)
-    p.add_argument("--n_layers",      type=int,   default=6)
+    p.add_argument("--n_layers",      type=int,   default=1)
     p.add_argument("--grad_accum",    type=int,   default=1)
     p.add_argument("--lambda_rank",   type=float, default=0.5)
     p.add_argument("--lambda_si",     type=float, default=0.0)
     p.add_argument("--patience",      type=int,   default=100)
-    p.add_argument("--num_workers",   type=int,   default=0)
+    p.add_argument("--num_workers",   type=int,   default=4)
     p.add_argument("--device",        default=None)
     p.add_argument("--resume",        default=None)
     a = p.parse_args()
