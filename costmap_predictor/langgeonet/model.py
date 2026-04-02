@@ -1,404 +1,532 @@
 """
-LangGeoNet: Language-Guided Geodesic Distance Prediction Network
+LangGeoNetV2: Dual-backbone language-guided geodesic cost predictor.
 
-Predicts normalized geodesic distance for each object in the current frame,
-conditioned on the language instruction and instance segmentation masks.
+Architecture improvements over V1 that prevent mean-field collapse:
 
-Architecture:
-    1. Visual Encoder (CLIP ViT) -> per-object features via masked pooling
-    2. Language Encoder (CLIP Text) -> instruction features
-    3. Cross-Modal Transformer -> fused object-language features
-    4. Geodesic Distance Head -> per-object normalized geodesic distance [0, 1]
+  1. Dual visual backbone:
+       • CLIP ViT-B/16  — semantic per-object features (last 4 layers trainable)
+       • DINOv2-small   — spatial/depth per-object features (last 2 blocks trainable)
+     DINOv2 captures 3-D scene structure (depth, layout) that single-image masked
+     pooling from CLIP misses, giving objects genuinely distinct representations.
+
+  2. Background-subtracted masked pooling on BOTH backbones.
+     Subtracting the scene mean removes the shared "image DC component" that
+     made all K objects collapse after pooling from a single frozen CLIP image.
+
+  3. Geometry-keyed self-attention (new module):
+     Q and K are derived from 2-D geometry, not visual features.
+     Objects exchange information via spatially-defined attention weights,
+     preventing gradient-cancellation collapse when Q=K=near-identical features.
+
+  4. Geometry bypass directly into the cost head (retained from V1).
+     2-D geometry (centroid, area, bbox) is always distinct per object and
+     bypasses the transformer entirely, anchoring each object's prediction.
+
+  5. Bradley-Terry ranking loss (in losses.py) replaces the margin/hinge loss.
+     Produces non-zero gradients everywhere — no dead-zone around a margin.
+
+Input API (unchanged from V1, compatible with train.py):
+    forward(images, masks_list, class_ids_list, input_ids, attention_mask)
+
+Output API (unchanged):
+    (predictions: list[B] of [K_b] tensors,
+     attn_weights_all: list of cross-attn weight tensors)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel, Dinov2Model
 
 
-# -------------------------------------------------------
-# Module 1: Masked Object Pooling
-# -------------------------------------------------------
+# ── Normalisation constants ────────────────────────────────────────────────────
+# Convert CLIP-preprocessed images → DINOv2-preprocessed images inline.
+_CLIP_MEAN = [0.48145466, 0.4578275,  0.40821073]
+_CLIP_STD  = [0.26862954, 0.26130258, 0.27577711]
+_DINO_MEAN = [0.485,      0.456,      0.406      ]
+_DINO_STD  = [0.229,      0.224,      0.225      ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: background-subtracted masked average pooling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bg_sub_masked_pool(feature_map: torch.Tensor,
+                        masks_list: list) -> list:
+    """
+    For each batch item, pool per-object features then subtract the scene mean.
+
+    Args:
+        feature_map : [B, N_patches, D]  (square patch grid: N = H_f * W_f)
+        masks_list  : list[B] of [K_b, H, W] bool tensors
+
+    Returns:
+        list[B] of [K_b, D] background-subtracted object features.
+    """
+    B = feature_map.shape[0]
+    results = []
+    for b in range(B):
+        mask_b = masks_list[b]          # [K, H, W]
+        K = mask_b.shape[0]
+        if K == 0:
+            results.append(torch.zeros(0, feature_map.shape[-1],
+                                       device=feature_map.device))
+            continue
+        feat = feature_map[b]           # [N, D]
+        N, D = feat.shape
+        H_f = W_f = int(N ** 0.5)
+        feat_flat = feat.reshape(-1, D)                              # [H_f*W_f, D]
+        masks_r = F.interpolate(
+            mask_b.unsqueeze(1).float(),
+            size=(H_f, W_f),
+            mode='nearest',
+        ).squeeze(1).reshape(K, -1)                                  # [K, H_f*W_f]
+        mask_sum = masks_r.sum(1, keepdim=True).clamp(min=1e-6)
+        pooled   = torch.mm(masks_r, feat_flat) / mask_sum           # [K, D]
+        scene_mn = feat_flat.mean(0, keepdim=True)                   # [1, D]
+        results.append(pooled - scene_mn)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: 2-D geometry features from instance masks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_geom(masks: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        masks : [K, H, W] bool
+
+    Returns:
+        [K, 5]  — (cx, cy, area_norm, bbox_w, bbox_h), all in [0, 1]
+    """
+    K, H, W = masks.shape
+    geom = torch.zeros(K, 5, device=masks.device)
+    for k in range(K):
+        m = masks[k]
+        area = m.float().sum()
+        if area < 1:
+            continue
+        ys, xs = torch.where(m > 0)
+        cx = xs.float().mean() / W
+        cy = ys.float().mean() / H
+        bbox_w = (xs.max() - xs.min() + 1).float() / W
+        bbox_h = (ys.max() - ys.min() + 1).float() / H
+        geom[k] = torch.stack([cx, cy, area / (H * W), bbox_w, bbox_h])
+    return geom
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 1: MaskedObjectPooling  (kept for API / checkpoint compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MaskedObjectPooling(nn.Module):
-    """
-    Extracts per-object features from a visual feature map using instance masks.
-    For each object mask, performs masked average pooling over the spatial feature map,
-    then concatenates geometric features.
-    """
+    """Legacy module — retained so older checkpoints and unit tests still load."""
 
-    def __init__(self, visual_dim, geom_dim=5, out_dim=256):  # ← removed class_embed_dim, num_classes
+    def __init__(self, visual_dim, geom_dim=5, out_dim=256):
         super().__init__()
         self.out_dim = out_dim
-        # ← removed: self.class_embedding = nn.Embedding(num_classes, class_embed_dim)
         self.projection = nn.Sequential(
-            nn.Linear(visual_dim + geom_dim, out_dim),  # ← removed class_embed_dim
+            nn.Linear(visual_dim + geom_dim, out_dim),
             nn.GELU(),
             nn.LayerNorm(out_dim),
             nn.Linear(out_dim, out_dim),
         )
 
     def compute_geometric_features(self, masks):
+        return _compute_geom(masks)
+
+    def forward(self, feature_map, masks, class_ids=None):
+        clip_objs = _bg_sub_masked_pool(feature_map, masks)
+        results = []
+        for b, pooled in enumerate(clip_objs):
+            geom     = _compute_geom(masks[b])
+            combined = torch.cat([pooled, geom], dim=-1)
+            results.append(self.projection(combined))
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 2: Geometry-Keyed Self-Attention
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GeometryKeyedSelfAttention(nn.Module):
+    """
+    Objects exchange information via geometry-defined attention.
+
+    Q and K are projected from 2-D geometry (centroid, bbox, area), NOT from
+    the visual features.  Attention weights reflect spatial relationships
+    between objects regardless of visual similarity.  V carries the rich
+    visual content that gets redistributed.
+
+    WHY THIS PREVENTS COLLAPSE:
+    After pooling from a single frozen CLIP image all K object features are
+    nearly identical -> Q ≈ K ≈ constant -> standard self-attn collapses to
+    averaging V, which is also nearly constant.  By deriving Q and K from
+    geometry (always distinct per object), attention patterns remain
+    spatially meaningful even with visually identical V's.
+    """
+
+    def __init__(self, d_model: int, n_heads: int,
+                 geom_dim: int = 5, dropout: float = 0.1):
+        super().__init__()
+        self.geom_qk = nn.Linear(geom_dim, d_model)
+        self.attn    = nn.MultiheadAttention(d_model, n_heads,
+                                             dropout=dropout, batch_first=True)
+        self.norm    = nn.LayerNorm(d_model)
+        self.drop    = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor,
+                geom: torch.Tensor,
+                mask: torch.Tensor = None) -> torch.Tensor:
         """
-        Compute geometric features for each object mask.
-
-        Args:
-            masks: [K, H, W] binary instance masks
-
-        Returns:
-            geom_feats: [K, 5] - (centroid_x, centroid_y, area, bbox_w, bbox_h) all normalized
+        x    : [B, K, d_model]
+        geom : [B, K, geom_dim]
+        mask : [B, K] bool, True = valid object
         """
-        K, H, W = masks.shape
-        device = masks.device
-        geom_feats = torch.zeros(K, 5, device=device)
-
-        for k in range(K):
-            mask = masks[k]  # [H, W]
-            area = mask.float().sum()
-            if area < 1:
-                continue
-
-            ys, xs = torch.where(mask > 0)
-            cx = xs.float().mean() / W
-            cy = ys.float().mean() / H
-
-            x_min, x_max = xs.min().float(), xs.max().float()
-            y_min, y_max = ys.min().float(), ys.max().float()
-            bbox_w = (x_max - x_min + 1) / W
-            bbox_h = (y_max - y_min + 1) / H
-            area_norm = area / (H * W)
-
-            geom_feats[k] = torch.tensor([cx, cy, area_norm, bbox_w, bbox_h], device=device)
-
-        return geom_feats
-
-    def forward(self, feature_map, masks, class_ids=None):  # ← class_ids now unused
-        """
-        Args:
-            feature_map: [B, N_patches, D] CLIP ViT patch features
-            masks:       list of [K_b, H, W] binary masks per batch item
-            class_ids:   ignored, kept for API compatibility
-
-        Returns:
-            object_features: list of [K_b, out_dim] per batch item
-        """
-        batch_size = len(masks)
-        all_obj_feats = []
-
-        for b in range(batch_size):
-            mask_b = masks[b]    # [K, H, W]
-            K = mask_b.shape[0]
-
-            if K == 0:
-                all_obj_feats.append(
-                    torch.zeros(0, self.out_dim, device=feature_map.device)
-                )
-                continue
-
-            feat = feature_map[b]  # [N_patches, D]
-            N, D = feat.shape
-            H_f = W_f = int(N ** 0.5)
-            feat_spatial = feat.reshape(H_f, W_f, D)  # [H_f, W_f, D]
-
-            # Resize masks to feature map resolution
-            masks_resized = F.interpolate(
-                mask_b.unsqueeze(1).float(),  # [K, 1, H, W]
-                size=(H_f, W_f),
-                mode='nearest'
-            ).squeeze(1)  # [K, H_f, W_f]
-
-            # Masked average pooling: [K, D]
-            masks_flat = masks_resized.reshape(K, -1)           # [K, H_f*W_f]
-            feat_flat = feat_spatial.reshape(-1, D)              # [H_f*W_f, D]
-            mask_sum = masks_flat.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            pooled = torch.mm(masks_flat, feat_flat) / mask_sum  # [K, D]
-
-            # Geometric features
-            geom = self.compute_geometric_features(mask_b)  # [K, 5]
-
-            # Concatenate pooled + geom only, then project
-            combined = torch.cat([pooled, geom], dim=-1)   # ← removed cls_emb
-            obj_feat = self.projection(combined)            # [K, out_dim]
-
-            all_obj_feats.append(obj_feat)
-
-        return all_obj_feats
+        qk  = self.geom_qk(geom)
+        kpm = (~mask) if mask is not None else None
+        out, _ = self.attn(qk, qk, x, key_padding_mask=kpm)
+        return self.norm(x + self.drop(out))
 
 
-# -------------------------------------------------------
-# Module 2: Cross-Modal Transformer Layer
-# -------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 3: Cross-Modal Transformer Layer (geometry-conditioned query)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class CrossModalTransformerLayer(nn.Module):
     """
-    Transformer layer where object tokens self-attend, then cross-attend to language.
-    
-    Flow:
-        objects -> self-attention -> cross-attention(objects, language) -> FFN
+    Objects cross-attend to language tokens with geometry-biased queries.
+    Even objects with identical visual features query language with distinct
+    vectors (geometry-shifted) and receive distinct responses.
     """
 
-    def __init__(self, d_model=256, n_heads=8, d_ff=1024, dropout=0.1):
+    def __init__(self, d_model=256, n_heads=8, d_ff=1024,
+                 dropout=0.1, geom_dim=5):
         super().__init__()
-
-        # Object self-attention
-        self.self_attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
+        self.geom_query_proj = nn.Linear(geom_dim, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads,
+                                                dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop2 = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model), nn.Dropout(dropout),
         )
+        self.norm3 = nn.LayerNorm(d_model)
+        # Kept for checkpoint compat with V1 which had a self_attn weight
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads,
+                                               dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.drop1 = nn.Dropout(dropout)
 
-        # Object-Language cross-attention
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.drop2 = nn.Dropout(dropout)
-
-        # Feed-forward
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm3 = nn.LayerNorm(d_model)
-
-    def forward(self, query, context, query_mask=None, context_mask=None):
-        """
-        Args:
-            query:        [B, K, D] object tokens
-            context:      [B, L, D] language tokens
-            query_mask:   [B, K] True = valid token  (unused — no self-attn)
-            context_mask: [B, L] True = valid token
-
-        Returns:
-            out:          [B, K, D] updated object tokens
-            attn_weights: [B, K, L] cross-attention weights
-
-        NOTE: self-attention is intentionally disabled.
-        Self-attention between object tokens causes progressive representation
-        collapse: all K objects (which share the same frozen CLIP image context)
-        become near-identical after each layer (cosine-sim rises from 0.58 → 0.87
-        over 6 layers), killing per-object discriminability.
-        Objects only need to cross-attend to language for instruction grounding.
-        """
-        c_pad = ~context_mask if context_mask is not None else None
-
-        # Cross-attention only: each object independently attends to language
-        residual = query
-        x_cross, attn_weights = self.cross_attn(
-            query, context, context, key_padding_mask=c_pad
-        )
-        x = self.norm2(residual + self.drop2(x_cross))
-
-        # FFN
-        residual = x
-        x = self.norm3(residual + self.ffn(x))
-
-        return x, attn_weights
+    def forward(self, query, context,
+                query_mask=None, context_mask=None, geom=None):
+        c_pad = (~context_mask) if context_mask is not None else None
+        q = query + self.geom_query_proj(geom) if geom is not None else query
+        x_cross, attn_w = self.cross_attn(q, context, context,
+                                           key_padding_mask=c_pad)
+        x = self.norm2(query + self.drop2(x_cross))
+        x = self.norm3(x + self.ffn(x))
+        return x, attn_w
 
 
-# -------------------------------------------------------
-# Module 3: LangGeoNet (Full Model)
-# -------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 4: LangGeoNetV2
+# ─────────────────────────────────────────────────────────────────────────────
 
-class LangGeoNet(nn.Module):
+class LangGeoNetV2(nn.Module):
     """
-    Language-Guided Geodesic Distance Prediction Network.
+    Dual-backbone (CLIP ViT-B/16 + DINOv2-small) language-guided geodesic
+    cost predictor.
 
-    Input:
-        - RGB frame [B, 3, 224, 224]
-        - Instance masks: list of [K_b, H, W]
-        - Class IDs: list of [K_b]
-        - Instruction token IDs [B, L]  (CLIP tokenizer output)
-        - Instruction attention mask [B, L]
+    Peak VRAM: ~10-15 GB at batch=32 on a single GPU.  Fits within 32 GB.
 
-    Output:
-        - Predicted normalized geodesic distance [0, 1] per object
-          (list of [K_b] tensors)
+    Trainable parameter groups:
+        CLIP visual : last 4 transformer blocks + post_layernorm
+        CLIP text   : last 4 transformer blocks + final_layer_norm
+        DINOv2      : last 2 encoder blocks + layernorm
+        All new heads (obj_proj, geom_self_attn, transformer_layers, geo_head)
     """
 
     def __init__(
         self,
-        d_model=256,
-        n_heads=8,
-        n_layers=6,
-        d_ff=1024,
-        dropout=0.1,
-        num_classes=None,       # ← no longer used, kept for compat
-        clip_model_name="openai/clip-vit-base-patch16",
-        freeze_clip=True,
-        max_objects=50,
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_layers: int = 2,
+        d_ff: int = 1024,
+        dropout: float = 0.1,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
+        dino_model_name: str = "facebook/dinov2-small",
+        freeze_clip: bool = True,
+        freeze_dino: bool = True,
+        max_objects: int = 50,
+        num_classes=None,       # unused — kept for call-site compat
     ):
         super().__init__()
-        self.d_model = d_model
-        self.max_objects = max_objects
+        self.d_model         = d_model
+        self.max_objects     = max_objects
+        self.geom_dim        = 5
+        self.geom_bypass_dim = 64
 
-        # ========== Visual + Language Encoder (CLIP) ==========
-        self.clip = CLIPModel.from_pretrained(clip_model_name)
-        self.clip_visual_dim = self.clip.config.vision_config.hidden_size
-        self.clip_text_dim = self.clip.config.text_config.hidden_size
+        # ── Backbone 1: CLIP (visual + text) ─────────────────────────────────
+        self.clip        = CLIPModel.from_pretrained(clip_model_name)
+        clip_vis_dim     = self.clip.config.vision_config.hidden_size   # 768
+        clip_txt_dim     = self.clip.config.text_config.hidden_size     # 512
 
         if freeze_clip:
-            for param in self.clip.parameters():
-                param.requires_grad = False
+            for p in self.clip.parameters():
+                p.requires_grad = False
+            for layer in self.clip.vision_model.encoder.layers[-4:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+            for p in self.clip.vision_model.post_layernorm.parameters():
+                p.requires_grad = True
+            for layer in self.clip.text_model.encoder.layers[-4:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+            for p in self.clip.text_model.final_layer_norm.parameters():
+                p.requires_grad = True
 
-        self.visual_proj = nn.Linear(self.clip_visual_dim, d_model)
-        self.lang_proj = nn.Linear(self.clip_text_dim, d_model)
+        # ── Backbone 2: DINOv2-small (spatial / depth features) ──────────────
+        self.dino    = Dinov2Model.from_pretrained(dino_model_name)
+        dino_dim     = self.dino.config.hidden_size                     # 384
 
-        # ========== Object Encoder (no class embedding) ==========
-        self.object_encoder = MaskedObjectPooling(
-            visual_dim=d_model,
-            geom_dim=5,
-            out_dim=d_model,    # ← removed class_embed_dim, num_classes
+        if freeze_dino:
+            for p in self.dino.parameters():
+                p.requires_grad = False
+            for layer in self.dino.encoder.layer[-2:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+            for p in self.dino.layernorm.parameters():
+                p.requires_grad = True
+
+        # Normalisation buffers survive .to(device) / state_dict saves
+        self.register_buffer('_clip_mean',
+                             torch.tensor(_CLIP_MEAN).view(1, 3, 1, 1))
+        self.register_buffer('_clip_std',
+                             torch.tensor(_CLIP_STD ).view(1, 3, 1, 1))
+        self.register_buffer('_dino_mean',
+                             torch.tensor(_DINO_MEAN).view(1, 3, 1, 1))
+        self.register_buffer('_dino_std',
+                             torch.tensor(_DINO_STD ).view(1, 3, 1, 1))
+
+        # ── Projections ───────────────────────────────────────────────────────
+        self.clip_vis_proj = nn.Linear(clip_vis_dim, d_model)
+        self.dino_vis_proj = nn.Linear(dino_dim,      d_model)
+        self.lang_proj     = nn.Linear(clip_txt_dim,  d_model)
+
+        # Combined object projection: clip_obj(d) + dino_obj(d) + geom(5) -> d
+        self.obj_proj = nn.Sequential(
+            nn.Linear(2 * d_model + self.geom_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
         )
 
-        # ========== Type + Position Embeddings ==========
-        self.obj_type_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.lang_type_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.obj_pos_embed = nn.Parameter(torch.randn(1, max_objects, d_model) * 0.02)
+        # ── Geometry-keyed object self-attention ──────────────────────────────
+        self.geom_self_attn = GeometryKeyedSelfAttention(
+            d_model, n_heads, geom_dim=self.geom_dim, dropout=dropout
+        )
 
-        # ========== Cross-Modal Transformer ==========
+        # ── Type + positional embeddings ──────────────────────────────────────
+        self.obj_type_embed  = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.lang_type_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.obj_pos_embed   = nn.Parameter(
+            torch.randn(1, max_objects, d_model) * 0.02
+        )
+
+        # ── Cross-modal transformer ───────────────────────────────────────────
         self.transformer_layers = nn.ModuleList([
-            CrossModalTransformerLayer(d_model, n_heads, d_ff, dropout)
+            CrossModalTransformerLayer(d_model, n_heads, d_ff,
+                                       dropout, geom_dim=self.geom_dim)
             for _ in range(n_layers)
         ])
 
-        # ========== Instruction Pooling ==========
+        # ── Instruction pooling ───────────────────────────────────────────────
         self.instruction_pool_attn = nn.Linear(d_model, 1)
+        self.instr_align_proj      = nn.Linear(d_model, d_model)
 
-        # ========== Per-object instruction alignment projection ==========
-        # Projects the global instruction vector to the same space as x so
-        # the dot-product alignment score is meaningful and learnable.
-        self.instr_align_proj = nn.Linear(d_model, d_model)
-
-        # ========== Geodesic Distance Prediction Head ==========
-        # Input: object feature (d_model) + per-object alignment scalar (1)
-        # The alignment scalar is explicitly different per object and encodes
-        # how much each object's post-attention feature aligns with the instruction.
+        # ── Geometry bypass + cost head ───────────────────────────────────────
+        self.geom_bypass = nn.Sequential(
+            nn.Linear(self.geom_dim, self.geom_bypass_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.geom_bypass_dim),
+        )
+        # head input: d_model + 1 (align scalar) + geom_bypass_dim = 321
         self.geo_head = nn.Sequential(
-            nn.Linear(d_model + 1, d_model),
+            nn.Linear(d_model + 1 + self.geom_bypass_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Linear(d_model // 2, 1),
-            nn.Sigmoid(),  # normalized geodesic in [0, 1]
+            nn.Sigmoid(),
         )
 
-    def encode_visual(self, images):
-        """Extract CLIP ViT patch features -> [B, N_patches, d_model]"""
-        with torch.set_grad_enabled(
-            any(p.requires_grad for p in self.clip.parameters())
-        ):
-            vision_out = self.clip.vision_model(pixel_values=images)
-            patch_feats = vision_out.last_hidden_state[:, 1:, :]  # drop [CLS]
+    # ── Internal helpers ───────────────────────────────────────────────────────
 
-        return self.visual_proj(patch_feats)
+    def _renorm_for_dino(self, images: torch.Tensor) -> torch.Tensor:
+        """Convert CLIP-normalised images to DINOv2-normalised images."""
+        rgb01 = images * self._clip_std + self._clip_mean   # -> [0, 1]
+        return (rgb01 - self._dino_mean) / self._dino_std
+
+    def encode_visual_clip(self, images: torch.Tensor) -> torch.Tensor:
+        """CLIP ViT-B/16 -> [B, 196, d_model] patch features."""
+        grad_on = any(p.requires_grad
+                      for p in self.clip.vision_model.parameters())
+        with torch.set_grad_enabled(grad_on):
+            out = self.clip.vision_model(pixel_values=images)
+            patches = out.last_hidden_state[:, 1:, :]   # drop CLS  [B, 196, 768]
+        return self.clip_vis_proj(patches)
+
+    def encode_visual_dino(self, images: torch.Tensor) -> torch.Tensor:
+        """DINOv2-small -> [B, 256, d_model] patch features (224x224 input)."""
+        images_dino = self._renorm_for_dino(images)
+        grad_on = any(p.requires_grad for p in self.dino.parameters())
+        with torch.set_grad_enabled(grad_on):
+            out = self.dino(pixel_values=images_dino,
+                            interpolate_pos_encoding=True)
+            patches = out.last_hidden_state[:, 1:, :]   # drop CLS  [B, 256, 384]
+        return self.dino_vis_proj(patches)
 
     def encode_language(self, input_ids, attention_mask):
-        """Encode instruction with CLIP text encoder -> [B, L, d_model] + mask"""
-        with torch.set_grad_enabled(
-            any(p.requires_grad for p in self.clip.text_model.parameters())
-        ):
-            text_out = self.clip.text_model(
-                input_ids=input_ids, attention_mask=attention_mask
-            )
-        lang_feats = self.lang_proj(text_out.last_hidden_state)
-        return lang_feats, attention_mask.bool()
+        """CLIP text -> [B, L, d_model] + bool mask."""
+        grad_on = any(p.requires_grad
+                      for p in self.clip.text_model.parameters())
+        with torch.set_grad_enabled(grad_on):
+            out = self.clip.text_model(input_ids=input_ids,
+                                       attention_mask=attention_mask)
+        return self.lang_proj(out.last_hidden_state), attention_mask.bool()
 
-    def pool_instruction(self, lang_features, lang_mask):
-        """Attention-weighted pooling -> [B, d_model] global instruction vector."""
-        scores = self.instruction_pool_attn(lang_features).squeeze(-1)  # [B, L]
+    def pool_instruction(self, lang_feats, lang_mask):
+        """Attention-weighted pooling -> [B, d_model]."""
+        scores = self.instruction_pool_attn(lang_feats).squeeze(-1)
         scores = scores.masked_fill(~lang_mask, -1e9)
-        weights = F.softmax(scores, dim=-1)
-        return torch.bmm(weights.unsqueeze(1), lang_features).squeeze(1)
+        return torch.bmm(F.softmax(scores, -1).unsqueeze(1),
+                         lang_feats).squeeze(1)
 
-    def forward(self, images, masks_list, class_ids_list, input_ids, attention_mask):
+    # ── Forward ────────────────────────────────────────────────────────────────
+
+    def forward(self, images, masks_list, class_ids_list,
+                input_ids, attention_mask,
+                positions_list=None):
         """
-        Full forward pass.
+        Args:
+            images         : [B, 3, 224, 224]  CLIP-preprocessed
+            masks_list     : list[B] of [K_b, H, W] bool tensors
+            class_ids_list : ignored
+            input_ids      : [B, L]
+            attention_mask : [B, L]
+            positions_list : ignored (no agent position used)
 
         Returns:
-            predictions: list of [K_b] predicted geodesic distances
-            attn_weights_all: list of cross-attention weight tensors
+            predictions      : list[B] of [K_b] float tensors in [0, 1]
+            attn_weights_all : list of [B, K_max, L] cross-attn weight tensors
         """
-        B = images.shape[0]
+        B      = images.shape[0]
         device = images.device
 
-        # --- Encode ---
-        patch_feats = self.encode_visual(images)               # [B, N_p, d]
-        lang_feats, lang_mask = self.encode_language(input_ids, attention_mask)  # [B, L, d]
+        # ── Visual encoding ────────────────────────────────────────────────────
+        clip_feats = self.encode_visual_clip(images)    # [B, 196, d]
+        dino_feats = self.encode_visual_dino(images)    # [B, 256, d]
+
+        # ── Language encoding ──────────────────────────────────────────────────
+        lang_feats, lang_mask = self.encode_language(input_ids, attention_mask)
         instr_vec = self.pool_instruction(lang_feats, lang_mask)  # [B, d]
 
-        # --- Object features via masked pooling ---
-        obj_feats_list = self.object_encoder(patch_feats, masks_list, class_ids_list)
+        # ── Per-object pooling (background-subtracted, both backbones) ─────────
+        clip_obj_list = _bg_sub_masked_pool(clip_feats, masks_list)
+        dino_obj_list = _bg_sub_masked_pool(dino_feats, masks_list)
 
-        # --- Pad objects to [B, K_max, d] ---
-        K_counts = [f.shape[0] for f in obj_feats_list]
-        K_max = max(K_counts) if K_counts else 1  # no hard cap — use actual max
+        # ── Geometry + combined object projection ──────────────────────────────
+        geom_list = [_compute_geom(masks_list[b]) for b in range(B)]
+        K_counts  = [geom_list[b].shape[0]         for b in range(B)]
+        K_max     = max(K_counts) if K_counts else 1
 
-        obj_padded = torch.zeros(B, K_max, self.d_model, device=device)
-        obj_mask = torch.zeros(B, K_max, dtype=torch.bool, device=device)
+        obj_feats_list = []
+        for b in range(B):
+            K_b = K_counts[b]
+            if K_b == 0:
+                obj_feats_list.append(
+                    torch.zeros(0, self.d_model, device=device))
+                continue
+            combined = torch.cat(
+                [clip_obj_list[b], dino_obj_list[b], geom_list[b]], dim=-1
+            )                                           # [K_b, 2d+5]
+            obj_feats_list.append(self.obj_proj(combined))    # [K_b, d]
 
-        for b, (feats, K_b) in enumerate(zip(obj_feats_list, K_counts)):
-            K_b = min(K_b, K_max)
-            if K_b > 0:
-                obj_padded[b, :K_b] = feats[:K_b]
-                obj_mask[b, :K_b] = True
+        # ── Pad to [B, K_max, d] ──────────────────────────────────────────────
+        obj_padded  = torch.zeros(B, K_max, self.d_model, device=device)
+        obj_mask    = torch.zeros(B, K_max, dtype=torch.bool, device=device)
+        geom_padded = torch.zeros(B, K_max, self.geom_dim,   device=device)
 
-        # --- Add type + position embeddings ---
-        # Interpolate positional embeddings if K_max exceeds the trained max_objects size
+        for b in range(B):
+            K_c = min(K_counts[b], K_max)
+            if K_c > 0:
+                obj_padded[b,  :K_c] = obj_feats_list[b][:K_c]
+                obj_mask[b,    :K_c] = True
+                geom_padded[b, :K_c] = geom_list[b][:K_c]
+
+        # ── Type + positional embeddings ───────────────────────────────────────
         if K_max <= self.max_objects:
-            pos_embed = self.obj_pos_embed[:, :K_max]          # [1, K_max, d]
+            pos_emb = self.obj_pos_embed[:, :K_max]
         else:
-            pos_embed = F.interpolate(
-                self.obj_pos_embed.permute(0, 2, 1),           # [1, d, max_objects]
-                size=K_max, mode='linear', align_corners=False
-            ).permute(0, 2, 1)                                  # [1, K_max, d]
-        obj_tokens = obj_padded + self.obj_type_embed + pos_embed
+            pos_emb = F.interpolate(
+                self.obj_pos_embed.permute(0, 2, 1),
+                size=K_max, mode='linear', align_corners=False,
+            ).permute(0, 2, 1)
+
+        x           = obj_padded + self.obj_type_embed + pos_emb
         lang_tokens = lang_feats + self.lang_type_embed
 
-        # --- Cross-modal transformer ---
-        x = obj_tokens
-        attn_weights_all = []
+        # ── Geometry-keyed self-attention (objects compare with each other) ────
+        x = self.geom_self_attn(x, geom_padded, mask=obj_mask)
 
+        # ── Cross-modal transformer (objects <-> language) ─────────────────────
+        attn_weights_all = []
         for layer in self.transformer_layers:
-            x, attn_w = layer(x, lang_tokens, obj_mask, lang_mask)
+            x, attn_w = layer(x, lang_tokens, obj_mask, lang_mask,
+                              geom=geom_padded)
             attn_weights_all.append(attn_w)
 
-        instr_proj = self.instr_align_proj(instr_vec)               # [B, d]
+        # ── Cost head ──────────────────────────────────────────────────────────
+        instr_proj = self.instr_align_proj(instr_vec)
         align = torch.bmm(
-            x, instr_proj.unsqueeze(-1)                             # [B, K, d] x [B, d, 1]
-        ).squeeze(-1) / (self.d_model ** 0.5)                       # [B, K] — different per object
-        head_input = torch.cat([x, align.unsqueeze(-1)], dim=-1)    # [B, K, d+1]
-        geo_pred = self.geo_head(head_input).squeeze(-1)             # [B, K_max]
+            x, instr_proj.unsqueeze(-1)
+        ).squeeze(-1) / (self.d_model ** 0.5)           # [B, K_max]
 
-        # --- Unpad ---
-        predictions = []
-        for b, K_b in enumerate(K_counts):
-            K_b = min(K_b, K_max)
-            predictions.append(geo_pred[b, :K_b])
+        geom_bp  = self.geom_bypass(geom_padded)         # [B, K_max, 64]
+        head_in  = torch.cat([x, align.unsqueeze(-1), geom_bp], dim=-1)
+        geo_pred = self.geo_head(head_in).squeeze(-1)    # [B, K_max]
 
+        predictions = [
+            geo_pred[b, :min(K_counts[b], K_max)] for b in range(B)
+        ]
         return predictions, attn_weights_all
 
 
-# -------------------------------------------------------
-# Factory
-# -------------------------------------------------------
+# Alias so any code that imports the old class name still works
+LangGeoNet = LangGeoNetV2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory (API-compatible with train.py positional call signature)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_langgeonet(
-    d_model=256,
-    n_heads=8,
-    n_layers=6,
-    num_classes=None,           # ← no longer needed
-    clip_model="openai/clip-vit-base-patch16",
-):
-    return LangGeoNet(
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        clip_model_name=clip_model,
+    d_model: int = 256,
+    n_heads: int = 8,
+    n_layers: int = 2,
+    num_classes=None,                           # unused — kept for compat
+    clip_model: str = "openai/clip-vit-base-patch16",
+) -> LangGeoNetV2:
+    return LangGeoNetV2(
+        d_model         = d_model,
+        n_heads         = n_heads,
+        n_layers        = n_layers,
+        clip_model_name = clip_model,
+        dino_model_name = "facebook/dinov2-small",
+        freeze_clip     = True,
+        freeze_dino     = True,
     )
