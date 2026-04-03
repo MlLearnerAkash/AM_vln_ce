@@ -12,6 +12,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from scipy.stats import spearmanr
 
@@ -246,6 +247,46 @@ def _render_cost_comparison_image(frame_rgb, masks_arr, gt_costs, pred_costs, al
     return img
 
 
+def _clip_lang_ln_norms(model: nn.Module) -> dict:
+    """Return the L2 norm of every LayerNorm weight in the unfrozen CLIP text layers.
+
+    Keys are prefixed with 'ln_norm/' so they group together in W&B.
+    Covers layer_norm1 and layer_norm2 of the last 6 encoder layers plus
+    the final_layer_norm of the text model.
+    """
+    norms = {}
+    text = model.clip.text_model
+    n_total = len(text.encoder.layers)
+    for idx, layer in enumerate(text.encoder.layers[-6:]):
+        abs_idx = n_total - 6 + idx
+        for ln_attr in ("layer_norm1", "layer_norm2"):
+            ln = getattr(layer, ln_attr)
+            norms[f"ln_norm/text_l{abs_idx}_{ln_attr}"] = ln.weight.norm().item()
+    norms["ln_norm/text_final"] = text.final_layer_norm.weight.norm().item()
+    return norms
+
+
+def _clip_lang_grad_norms(model: nn.Module) -> dict:
+    """L2 norm of accumulated gradients on the unfrozen CLIP text LayerNorm weights.
+
+    Call immediately after clip_grad_norm_ (before zero_grad) so gradients are intact.
+    Returns an empty dict when no gradients exist yet.
+    """
+    norms = {}
+    text = model.clip.text_model
+    n_total = len(text.encoder.layers)
+    for idx, layer in enumerate(text.encoder.layers[-6:]):
+        abs_idx = n_total - 6 + idx
+        for ln_attr in ("layer_norm1", "layer_norm2"):
+            g = getattr(layer, ln_attr).weight.grad
+            if g is not None:
+                norms[f"grad_norm/text_l{abs_idx}_{ln_attr}"] = g.norm().item()
+    g = text.final_layer_norm.weight.grad
+    if g is not None:
+        norms["grad_norm/text_final"] = g.norm().item()
+    return norms
+
+
 def _resume_from_checkpoint(resume, model, optimizer, scheduler, device):
     if not resume:
         return 0, float("inf")
@@ -279,7 +320,7 @@ def make_exp_dir(base_dir):
 # -------------------------------------------------------
 
 def train_one_epoch(model, loader, criterion, optimizer, device,
-                    grad_accum=1, wandb_run=None, global_step=0):
+                    grad_accum=1, wandb_run=None, global_step=0, lambda_lang=0.1):
     model.train()
     losses      = defaultdict(float)
     n           = 0
@@ -293,17 +334,49 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
         if all(m.shape[0] == 0 for m in masks_list):
             continue
 
-        cids = [None] * len(masks_list)
-        preds, _ = model(pixel_values, masks_list, cids, input_ids, attn_mask)
+        preds, lang_aux = model(pixel_values, masks_list, input_ids, attn_mask)
         loss, ld = criterion(preds, gts_list)
-        (loss / grad_accum).backward()
+
+        # Auxiliary language loss: Pearson correlation between lang_aux and the
+        # per-sample frame-mean GT cost within the batch.
+        #
+        # Why Pearson instead of MSE:
+        #   frame_mean_gt is a geometric quantity (same for any instruction given
+        #   the same frame).  MSE lets the model predict the global mean ~0.5 for
+        #   every instruction and achieve near-zero loss without ever distinguishing
+        #   instructions.  Pearson correlation loss demands the model correctly
+        #   RANK instructions by their mean cost — which requires discriminative
+        #   instr_vecs and forces real gradient flow to the text encoder.
+        frame_mean_gt = torch.stack([
+            g[torch.isfinite(g)].mean() if torch.isfinite(g).any()
+            else torch.tensor(0.5, device=device)
+            for g in gts_list
+        ])
+        if frame_mean_gt.shape[0] > 1 and frame_mean_gt.std() > 1e-4:
+            pred_c  = lang_aux     - lang_aux.mean()
+            tgt_c   = frame_mean_gt - frame_mean_gt.mean()
+            num     = (pred_c * tgt_c).sum()
+            denom   = (pred_c.norm() * tgt_c.norm()).clamp(min=1e-8)
+            aux_loss = 1.0 - num / denom          # 0 = perfect rank match
+        else:
+            aux_loss = F.mse_loss(lang_aux, frame_mean_gt)  # fallback for B=1
+        total_loss = loss + lambda_lang * aux_loss
+        ld["loss_lang_aux"] = aux_loss.item()
+        ld["loss_total"]    = total_loss.item()
+
+        (total_loss / grad_accum).backward()
 
         if (i + 1) % grad_accum == 0:
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norms = _clip_lang_grad_norms(model)
             optimizer.step()
             optimizer.zero_grad()
             if wandb_run is not None:
-                wandb_run.log({f"train/{k}": v for k, v in ld.items()} | {"batch_step": global_step})
+                wandb_run.log(
+                    {f"train/{k}": v for k, v in ld.items()}
+                    | grad_norms
+                    | {"batch_step": global_step}
+                )
             global_step += 1
 
         for k, v in ld.items():
@@ -336,9 +409,8 @@ def validate(model, loader, criterion, device,
             del batch
             continue
 
-        cids     = [None] * len(masks_list)
-        preds, _ = model(pixel_values, masks_list, cids, input_ids, attn_mask)
-        _, ld    = criterion(preds, gts_list)
+        preds, _ = model(pixel_values, masks_list, input_ids, attn_mask)
+        _, ld = criterion(preds, gts_list)
 
         for k, v in ld.items():
             losses[k] += v
@@ -396,12 +468,11 @@ def train_h5(
     clip_model: str = "openai/clip-vit-base-patch16",
     bert_model: str = "bert-base-uncased",
     d_model: int = 256, n_heads: int = 8, n_layers: int = 6,
-    num_classes: int = 1550,
     epochs: int = 50, batch_size: int = 8,
-    lr_head: float = 1e-4, lr_backbone: float = 1e-5,
+    lr_head: float = 1e-4, lr_backbone: float = 1e-5, lr_text: float = 5e-5,
     weight_decay: float = 0.01,
     warmup_epochs: int = 3, grad_accum: int = 1,
-    lambda_rank: float = 0.5, lambda_si: float = 0.3,
+    lambda_rank: float = 0.5, lambda_si: float = 0.3, lambda_lang: float = 0.1,
     num_workers: int = 0, seed: int = 42, patience: int = 10,
     device=None,
     resume: str | None = None,
@@ -417,7 +488,7 @@ def train_h5(
     os.makedirs(analysis_dir, exist_ok=True)
 
     logger.info("Building model...")
-    model   = build_langgeonet(d_model, n_heads, n_layers, num_classes, clip_model).to(device)
+    model   = build_langgeonet(d_model, n_heads, n_layers, clip_model=clip_model).to(device)
     total_p = sum(p.numel() for p in model.parameters())
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Params: {total_p:,} total  {train_p:,} trainable")
@@ -454,15 +525,30 @@ def train_h5(
         logger.warning("wandb not installed — skipping.")
 
     backbone_names = {"clip", "bert", "dino"}   # include DINOv2 backbone
-    head_params, bb_params = [], []
+    text_enc_params, vis_enc_params, head_params = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        (bb_params if any(bn in name for bn in backbone_names) else head_params).append(p)
+        if "clip.text_model" in name:
+            text_enc_params.append(p)
+        elif "clip.vision_model" in name or "dino" in name:
+            vis_enc_params.append(p)
+        else:
+            head_params.append(p)
+
+    logger.info(
+        f"  Params — head: {sum(p.numel() for p in head_params):,}  "
+        f"vis_enc: {sum(p.numel() for p in vis_enc_params):,}  "
+        f"text_enc: {sum(p.numel() for p in text_enc_params):,}  "
+        f"(lr_head={lr_head:.0e}  lr_backbone={lr_backbone:.0e}  lr_text={lr_text:.0e})"
+    )
 
     optimizer = optim.AdamW([
-        {"params": head_params, "lr": lr_head},
-        {"params": bb_params,   "lr": lr_backbone},
+        {"params": head_params,     "lr": lr_head},
+        {"params": vis_enc_params,  "lr": lr_backbone},
+        # weight_decay=0: text LN/bias params must not be decayed — the perfectly
+        # linear LN-norm shrinkage was weight decay dominating the gradient signal.
+        {"params": text_enc_params, "lr": lr_text, "weight_decay": 0.0},
     ], weight_decay=weight_decay)
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda ep: (
@@ -484,7 +570,7 @@ def train_h5(
 
         train_loss, global_step = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            grad_accum, wandb_run, global_step,
+            grad_accum, wandb_run, global_step, lambda_lang,
         )
         val_m = validate(model, val_loader, criterion, device,
                  wandb_run=wandb_run, exp_dir=analysis_dir, epoch=epoch + 1, max_viz=8)
@@ -497,7 +583,7 @@ def train_h5(
             f"  Train | total={train_loss['loss_total']:.4f}  "
             f"reg={train_loss['loss_regression']:.4f}  "
             f"rank={train_loss['loss_ranking']:.4f}  "
-            f"div={train_loss.get('loss_diversity', 0.0):.4f}"
+            f"lang_aux={train_loss.get('loss_lang_aux', 0.0):.4f}"
         )
         logger.info(
             f"  Val   | MAE={val_m['mae']:.4f}  RMSE={val_m['rmse']:.4f}  "
@@ -511,9 +597,34 @@ def train_h5(
         )
         logger.info(f"  LR={lr:.2e} | {dt:.1f}s")
 
+        ln_norms = _clip_lang_ln_norms(model)
+        logger.info(
+            "  CLIP text LN norms | " +
+            "  ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in ln_norms.items())
+        )
+
+        # Modality contribution probe on first val batch
+        contrib = {}
+        try:
+            probe_batch = next(iter(val_loader))
+            pv, ii, am, ml, _ = _prepare_batch(probe_batch, device)
+            if not all(m.shape[0] == 0 for m in ml):
+                vis_pct, lang_pct = model.modality_contributions(pv, ml, ii, am)
+                contrib = {
+                    "contrib/visual_pct":  vis_pct,
+                    "contrib/lang_pct":    lang_pct,
+                }
+                logger.info(
+                    f"  Modality contrib | visual={vis_pct:.1f}%  language={lang_pct:.1f}%"
+                )
+        except Exception as e:
+            logger.warning(f"  Modality contrib probe failed: {e}")
+
         if wandb_run is not None:
             epoch_log = {f"epoch/train_{k}": v for k, v in train_loss.items()}
             epoch_log.update({f"epoch/val_{k}": v for k, v in val_m.items()})
+            epoch_log.update(ln_norms)
+            epoch_log.update(contrib)
             epoch_log["epoch/lr"]       = lr
             epoch_log["epoch/duration"] = dt
             epoch_log["epoch"]          = epoch + 1
@@ -532,7 +643,7 @@ def train_h5(
                 "best_val_mae":         best_mae,
                 "val_metrics":          val_m,
                 "config": dict(d_model=d_model, n_heads=n_heads, n_layers=n_layers,
-                               num_classes=num_classes, clip_model=clip_model),
+                               clip_model=clip_model),
             }, os.path.join(ckpt_dir, "best_model.pt"))
             logger.info(f"  ★ Best model saved (MAE={best_mae:.4f})")
             if wandb_run is not None:
@@ -577,11 +688,13 @@ if __name__ == "__main__":
     p.add_argument("--batch_size",    type=int,   default=8)
     p.add_argument("--lr_head",       type=float, default=1e-3)
     p.add_argument("--lr_backbone",   type=float, default=1e-5)
+    p.add_argument("--lr_text",       type=float, default=5e-5)
     p.add_argument("--d_model",       type=int,   default=256)
     p.add_argument("--n_layers",      type=int,   default=1)
     p.add_argument("--grad_accum",    type=int,   default=1)
     p.add_argument("--lambda_rank",   type=float, default=0.5)
     p.add_argument("--lambda_si",     type=float, default=0.0)
+    p.add_argument("--lambda_lang",   type=float, default=0.5)
     p.add_argument("--patience",      type=int,   default=100)
     p.add_argument("--num_workers",   type=int,   default=4)
     p.add_argument("--device",        default=None)
@@ -600,11 +713,13 @@ if __name__ == "__main__":
         batch_size=a.batch_size,
         lr_head=a.lr_head,
         lr_backbone=a.lr_backbone,
+        lr_text=a.lr_text,
         d_model=a.d_model,
         n_layers=a.n_layers,
         grad_accum=a.grad_accum,
         lambda_rank=a.lambda_rank,
         lambda_si=a.lambda_si,
+        lambda_lang=a.lambda_lang,
         patience=a.patience,
         num_workers=a.num_workers,
         device=a.device,

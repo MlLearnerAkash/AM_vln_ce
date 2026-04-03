@@ -513,7 +513,7 @@ def run_inference(
     # ── model forward ─────────────────────────────────────────────────────────
     with torch.no_grad():
         preds, _ = _model(
-            pixel_values, [masks_t], [None],
+            pixel_values, [masks_t],
             input_ids, attention_mask,
         )
     pred_costs = preds[0].float().cpu().numpy()   # [K]

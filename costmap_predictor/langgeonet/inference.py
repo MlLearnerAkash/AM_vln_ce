@@ -102,10 +102,9 @@ class LangGeoNetPredictor:
 
         masks_t = torch.from_numpy(masks.astype(bool)).to(self.device)  # [K_valid, H, W]
 
-        predictions, attn_weights_all = self.model(
+        predictions = self.model(
             images=pixel_values,
             masks_list=[masks_t],
-            class_ids_list=None,   # ← not used anymore
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
@@ -118,16 +117,6 @@ class LangGeoNetPredictor:
             costmap[masks[k] > 0] = distances[k]
 
         attn_map = None
-        if attn_weights_all:
-            last = attn_weights_all[-1]
-            # L_actual = non-padding tokens; skip position 0 (CLIP SOT sink)
-            # and the final EOS token so only content tokens are shown.
-            L_total = int(attention_mask.sum().item())  # includes SOT + content + EOS
-            # content tokens are positions 1 .. L_total-2  (exclude SOT=0 and EOS=L_total-1)
-            content_start = 1
-            content_end   = max(content_start + 1, L_total - 1)  # at least 1 token
-            attn_map = last[0, :K, content_start:content_end].cpu().numpy()  # [K, L_content]
-
         return distances, costmap, attn_map
 
     # ----------------------------------------------------------
@@ -307,10 +296,9 @@ class LangGeoNetPredictor:
 
         masks_t = [torch.from_numpy(m.astype(bool)).to(self.device) for m in filtered_masks]
 
-        predictions, _ = self.model(
+        predictions = self.model(
             images=pixel_values,
             masks_list=masks_t,
-            class_ids_list=None,   # ← not used anymore
             input_ids=input_ids,
             attention_mask=attention_mask,
         )

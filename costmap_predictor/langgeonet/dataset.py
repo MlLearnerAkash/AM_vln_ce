@@ -557,7 +557,7 @@ class H5EpisodePathLengthsDataset(Dataset):
 
 def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, shuffle: bool = False, num_workers: int = 0, val_split: float= 0.2, seed: int = 42,):
     with h5py.File(h5_path, 'r') as hf:
-        all_keys = sorted(hf.keys())#[:300]
+        all_keys = sorted(hf.keys())#[]
 
     # Shuffle and split at episode level
     rng = random.Random(seed)
