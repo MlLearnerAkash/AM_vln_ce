@@ -15,8 +15,10 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.stats import spearmanr
 
+import random as _random
+
 from model import build_langgeonet
-from dataset import create_h5_episode_pathlengths_dataloader
+from dataset import H5EpisodePathLengthsDataset, create_h5_episode_pathlengths_dataloader
 from losses import LangGeoNetLoss
 
 try:
@@ -310,7 +312,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
 
         if (i + 1) % 50 == 0:
             logger.info(f"  batch {i+1}/{len(loader)}  loss={losses['loss_total']/n:.4f}")
-        break
+
+
 
     return {k: v / max(n, 1) for k, v in losses.items()}, global_step
 
@@ -364,8 +367,6 @@ def validate(model, loader, criterion, device,
                 except Exception as e:
                     print(f"Viz sample {i} failed: {e}")
             first_batch_vizd = True
-        break
-
     avg_losses = {k: v / max(n, 1) for k, v in losses.items()}
     metrics    = compute_metrics(all_preds, all_gts)
     metrics.update(avg_losses)
@@ -422,16 +423,14 @@ def train_h5(
     logger.info(f"Params: {total_p:,} total  {train_p:,} trainable")
 
     logger.info("Loading data...")
-    train_loader, val_loader = create_h5_episode_pathlengths_dataloader(
-        h5_path=h5_path, batch_size=batch_size,
-        shuffle=False, num_workers=num_workers,
-    )
-    # val_loader = create_h5_episode_pathlengths_dataloader(
-    #     h5_path=val_h5_path or h5_path,
-    #     batch_size=batch_size, shuffle=False, num_workers=num_workers,
-    # )
-    if not val_h5_path:
-        logger.warning("No val H5 provided — reusing train set for validation.")
+  
+
+    train_loader, val_loader= create_h5_episode_pathlengths_dataloader(h5_path= h5_path, batch_size= batch_size, 
+                                                                       shuffle= False, num_workers= num_workers, 
+                                                                       val_split= 0.2, seed= 42)
+    logger.info(f"# train_episodes: {len(train_loader)}, # val_loader: {len(val_loader)}")
+    logger.info(f"Loader sizes: {len(train_loader)} train batches, "
+                f"{len(val_loader)} val batches (bs={batch_size})")
 
     wandb_run = None
     if use_wandb and WANDB_AVAILABLE:
@@ -454,7 +453,7 @@ def train_h5(
     elif use_wandb:
         logger.warning("wandb not installed — skipping.")
 
-    backbone_names = {"clip", "bert"}
+    backbone_names = {"clip", "bert", "dino"}   # include DINOv2 backbone
     head_params, bb_params = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -487,7 +486,7 @@ def train_h5(
             model, train_loader, criterion, optimizer, device,
             grad_accum, wandb_run, global_step,
         )
-        val_m = validate(model, train_loader, criterion, device,
+        val_m = validate(model, val_loader, criterion, device,
                  wandb_run=wandb_run, exp_dir=analysis_dir, epoch=epoch + 1, max_viz=8)
         scheduler.step()
 
@@ -498,7 +497,7 @@ def train_h5(
             f"  Train | total={train_loss['loss_total']:.4f}  "
             f"reg={train_loss['loss_regression']:.4f}  "
             f"rank={train_loss['loss_ranking']:.4f}  "
-            f"si={train_loss['loss_scale_invariant']:.4f}"
+            f"div={train_loss.get('loss_diversity', 0.0):.4f}"
         )
         logger.info(
             f"  Val   | MAE={val_m['mae']:.4f}  RMSE={val_m['rmse']:.4f}  "

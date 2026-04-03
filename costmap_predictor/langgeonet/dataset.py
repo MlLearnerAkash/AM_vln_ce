@@ -422,6 +422,9 @@ class H5EpisodePathLengthsDataset(Dataset):
                 n_frames = len(ep_data['frame_data'])
                 self.episode_frame_counts[ep] = n_frames
 
+                if n_frames > 150:
+                    continue
+
                 for local_i, fd in enumerate(ep_data["frame_data"]):
                     self._ep_start.append(ep)
                     self._fr_local.append(local_i)
@@ -554,7 +557,7 @@ class H5EpisodePathLengthsDataset(Dataset):
 
 def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, shuffle: bool = False, num_workers: int = 0, val_split: float= 0.2, seed: int = 42,):
     with h5py.File(h5_path, 'r') as hf:
-        all_keys = sorted(hf.keys())[:10]
+        all_keys = sorted(hf.keys())#[:300]
 
     # Shuffle and split at episode level
     rng = random.Random(seed)
