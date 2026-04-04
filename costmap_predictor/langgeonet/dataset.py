@@ -551,7 +551,8 @@ class H5EpisodePathLengthsDataset(Dataset):
         "frame_node_ids":  frame_node_ids,
         'input_ids':      clip_text['input_ids'].squeeze(0),
         'attention_mask': clip_text['attention_mask'].squeeze(0),
-        'node_to_idx':    node_to_idx, 
+        'node_to_idx':    node_to_idx,
+        'instruction':    ep_data.get('instruction', ''),
     }
 
 
@@ -582,6 +583,7 @@ def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, 
             "node_registries":  [b["node_registry"] for b in batch],
             "node_to_idx":      [b["node_to_idx"] for b in batch],
             "frame_node_ids":   [b["frame_node_ids"] for b in batch],
+            "instructions":     [b["instruction"] for b in batch],
         }
     train_loader= DataLoader(train_ds, batch_size=batch_size,shuffle=shuffle,
                              num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,

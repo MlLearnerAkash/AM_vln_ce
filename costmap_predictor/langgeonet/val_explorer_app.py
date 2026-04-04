@@ -60,7 +60,7 @@ from transformers import CLIPProcessor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset import H5EpisodePathLengthsDataset, create_h5_episode_pathlengths_dataloader
-from model import build_langgeonet
+from model import build_langgeonet, build_vlm_langgeonet
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level singletons (initialised once at app startup)
@@ -76,6 +76,7 @@ _ep_sample_indices: dict[str, list[int]] = {}  # ep_id -> [dataset_idx, …]
 _ep_instructions: dict[str, str] = {}      # ep_id -> cached instruction text
 
 _h5_path: str = ""
+_is_vlm: bool = False                       # True when checkpoint uses VLMLangGeoNet
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,9 +98,10 @@ def load_model_and_dataset(
     device_str: str | None = None,
     val_split: float = 0.2,
     seed: int = 42,
+    vlm_path_override: str | None = None,
 ) -> None:
     """Load model checkpoint + build the val split of the H5 dataset."""
-    global _model, _val_dataset, _clip_processor, _device
+    global _model, _val_dataset, _clip_processor, _device, _is_vlm
     global _episode_ids, _ep_sample_indices, _ep_instructions, _h5_path
 
     _h5_path = h5_path
@@ -112,20 +114,36 @@ def load_model_and_dataset(
     print(f"[App] device: {_device}")
 
     # ── model ─────────────────────────────────────────────────────────────────
-    ckpt = torch.load(checkpoint_path, map_location=_device, weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg  = ckpt["config"]
-    _model = build_langgeonet(
-        d_model    = cfg["d_model"],
-        n_heads    = cfg["n_heads"],
-        n_layers   = cfg["n_layers"],
-        clip_model = cfg["clip_model"],
-    )
-    _model.load_state_dict(ckpt["model_state_dict"])
-    _model = _model.to(_device)
+    _is_vlm = bool(cfg.get("use_vlm", False))
+
+    if _is_vlm:
+        vlm_path = vlm_path_override or cfg["vlm_path"]
+        _model = build_vlm_langgeonet(
+            vlm_path   = vlm_path,
+            d_proj     = cfg.get("d_proj", 256),
+            n_unfreeze = cfg.get("vlm_unfreeze_layers", 4),
+        )
+        _model.load_state_dict(ckpt["model_state_dict"])
+        _model = _model.to(_device)
+        _clip_processor = None
+        print(f"[App] VLM model loaded (epoch {ckpt['epoch']}, "
+              f"val MAE={ckpt.get('best_val_mae', '?')})")
+    else:
+        _model = build_langgeonet(
+            d_model    = cfg["d_model"],
+            n_heads    = cfg["n_heads"],
+            n_layers   = cfg["n_layers"],
+            clip_model = cfg["clip_model"],
+        )
+        _model.load_state_dict(ckpt["model_state_dict"])
+        _model = _model.to(_device)
+        _clip_processor = CLIPProcessor.from_pretrained(cfg["clip_model"])
+        print(f"[App] CLIP model loaded (epoch {ckpt['epoch']}, "
+              f"val MAE={ckpt.get('best_val_mae', '?')})")
+
     _model.eval()
-    _clip_processor = CLIPProcessor.from_pretrained(cfg["clip_model"])
-    print(f"[App] model loaded (epoch {ckpt['epoch']}, "
-          f"val MAE={ckpt.get('best_val_mae', '?')})")
 
     # ── val dataset ───────────────────────────────────────────────────────────
     print("[App] building val dataset …")
@@ -480,23 +498,8 @@ def run_inference(
 
     sample = _val_dataset[dataset_idx]
 
-    # ── instruction tokens ────────────────────────────────────────────────────
-    instr = (instruction or "").strip()
-    if instr:
-        clip_text      = _clip_processor(
-            text=instr, padding="max_length",
-            truncation=True, max_length=77, return_tensors="pt",
-        )
-        input_ids      = clip_text["input_ids"].to(_device)
-        attention_mask = clip_text["attention_mask"].to(_device)
-    else:
-        # fall back to dataset-tokenised version (already padded to 77)
-        input_ids      = sample["input_ids"].unsqueeze(0).to(_device)
-        attention_mask = sample["attention_mask"].unsqueeze(0).to(_device)
-        instr          = _ep_instructions.get(ep_id, "")
-
-    # ── visual input ──────────────────────────────────────────────────────────
-    pixel_values   = sample["pixel_values"].unsqueeze(0).to(_device)
+    # ── shared sample fields ──────────────────────────────────────────────────
+    instr          = (instruction or "").strip() or _ep_instructions.get(ep_id, "")
     node_registry  = sample["node_registry"]
     frame_node_ids = sample["frame_node_ids"]
     frame_rgb      = sample["frame_rgb"]    # [H, W, 3] uint8
@@ -508,15 +511,29 @@ def run_inference(
     masks_arr = np.stack(
         [node_registry[nid].mask for nid in node_ids]
     ).astype(bool)  # [K, H, W]
-    masks_t   = torch.from_numpy(masks_arr).to(_device)
 
     # ── model forward ─────────────────────────────────────────────────────────
     with torch.no_grad():
-        preds, _ = _model(
-            pixel_values, [masks_t],
-            input_ids, attention_mask,
-        )
-    pred_costs = preds[0].float().cpu().numpy()   # [K]
+        if _is_vlm:
+            # VLMLangGeoNet: takes raw numpy rgb + masks + plain string instruction
+            preds_list, _ = _model([frame_rgb], [masks_arr], [instr])
+            pred_costs = preds_list[0].float().cpu().numpy()   # [K]
+        else:
+            # LangGeoNet: tokenise with CLIPProcessor, pass pixel_values tensor
+            if (instruction or "").strip():
+                clip_text      = _clip_processor(
+                    text=instr, padding="max_length",
+                    truncation=True, max_length=77, return_tensors="pt",
+                )
+                input_ids      = clip_text["input_ids"].to(_device)
+                attention_mask = clip_text["attention_mask"].to(_device)
+            else:
+                input_ids      = sample["input_ids"].unsqueeze(0).to(_device)
+                attention_mask = sample["attention_mask"].unsqueeze(0).to(_device)
+            pixel_values = sample["pixel_values"].unsqueeze(0).to(_device)
+            masks_t      = torch.from_numpy(masks_arr).to(_device)
+            preds, _ = _model(pixel_values, [masks_t], input_ids, attention_mask)
+            pred_costs = preds[0].float().cpu().numpy()   # [K]
 
     # ── GT costs ──────────────────────────────────────────────────────────────
     gt_costs = _compute_gt_costs(node_registry, node_ids)
@@ -796,14 +813,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Create a public Gradio share link.",
     )
+    parser.add_argument(
+        "--vlm_path",
+        default=None,
+        help="Override the VLM backbone path stored in the checkpoint "
+             "(useful when the model was trained on a different machine).",
+    )
     args = parser.parse_args()
 
     load_model_and_dataset(
-        checkpoint_path = args.checkpoint,
-        h5_path         = args.h5_path,
-        device_str      = args.device,
-        val_split       = args.val_split,
-        seed            = args.seed,
+        checkpoint_path    = args.checkpoint,
+        h5_path            = args.h5_path,
+        device_str         = args.device,
+        val_split          = args.val_split,
+        seed               = args.seed,
+        vlm_path_override  = args.vlm_path,
     )
 
     build_app(share=args.share, server_port=args.port)
