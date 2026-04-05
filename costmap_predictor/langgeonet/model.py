@@ -513,20 +513,29 @@ class VLMLangGeoNet(nn.Module):
     """
 
     def __init__(self, vlm_path: str, d_proj: int = 256,
-                 n_unfreeze: int = 4, dropout: float = 0.1):
+                 n_unfreeze: int = 4, dropout: float = 0.1,
+                 load_pretrained: bool = True):
         super().__init__()
         import math as _math
         self._math = _math
 
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoConfig
 
-        self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
-            vlm_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map=None,
-        )
+        if load_pretrained:
+            # Fresh training: load all 7 B pretrained weights from disk.
+            self.vlm = Qwen2VLForConditionalGeneration.from_pretrained(
+                vlm_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                device_map=None,
+            )
+        else:
+            # Resuming from a VLMLangGeoNet checkpoint: architecture only —
+            # no shard loading.  load_state_dict() will fill all weights.
+            cfg = AutoConfig.from_pretrained(vlm_path)
+            self.vlm = Qwen2VLForConditionalGeneration(cfg).to(torch.bfloat16)
         self.processor = AutoProcessor.from_pretrained(vlm_path)
+        self.processor.tokenizer.padding_side = "left"
         self.processor.tokenizer.padding_side = "left"
 
         self.hidden_dim  = self.vlm.config.hidden_size       # 3584
@@ -740,5 +749,9 @@ def build_vlm_langgeonet(
     vlm_path: str,
     d_proj: int = 256,
     n_unfreeze: int = 4,
+    load_pretrained: bool = True,
 ) -> VLMLangGeoNet:
-    return VLMLangGeoNet(vlm_path=vlm_path, d_proj=d_proj, n_unfreeze=n_unfreeze)
+    return VLMLangGeoNet(
+        vlm_path=vlm_path, d_proj=d_proj, n_unfreeze=n_unfreeze,
+        load_pretrained=load_pretrained,
+    )

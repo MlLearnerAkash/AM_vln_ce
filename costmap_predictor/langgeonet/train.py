@@ -813,8 +813,12 @@ def train_h5(
     # ── Build model ─────────────────────────────────────────────────────────
     logger.info("Building model...")
     if use_vlm:
+        # When resuming, skip loading the 7 B pretrained shards — the
+        # checkpoint state_dict already contains all weights.
+        _load_pretrained = (resume is None)
         model = build_vlm_langgeonet(
             vlm_path=vlm_path, d_proj=d_proj, n_unfreeze=vlm_unfreeze_layers,
+            load_pretrained=_load_pretrained,
         ).to(device)
     else:
         model = build_langgeonet(d_model, n_heads, n_layers, clip_model=clip_model).to(device)
