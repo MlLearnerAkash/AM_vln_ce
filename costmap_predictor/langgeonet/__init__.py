@@ -7,13 +7,12 @@ current frame, instance segmentation, and language instruction.
 
 # Use package-relative imports so the modules are resolved inside
 # the costmap_predictor.langgeonet package when imported elsewhere.
-from .model import LangGeoNet, build_langgeonet
+from .model import LangGeoNetV2
 from .losses import LangGeoNetLoss
 from .inference import LangGeoNetPredictor
 
 __all__ = [
-	"LangGeoNet",
-	"build_langgeonet",
+	"LangGeoNetV2",
 	"LangGeoNetLoss",
 	"LangGeoNetPredictor",
 ]

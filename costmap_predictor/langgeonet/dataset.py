@@ -4,7 +4,6 @@ import json
 import numpy as np
 import h5py
 from PIL import Image
-from typing import NamedTuple
 import random
 
 import torch
@@ -12,13 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import CLIPProcessor
 from utils.h5_writer import load_episode_from_hdf5
 from pycocotools import mask as mask_utils
-import torch
 
-
-class NodeEntry(NamedTuple):
-    node_id:  int
-    mask:     np.ndarray
-    path_row: np.ndarray
 
 class LangGeoNetDataset(Dataset):
     """
@@ -395,195 +388,623 @@ def create_h5_maskpls_dataloader(
         drop_last=shuffle,   # drop incomplete batches only during training
     )
 
-#----------------------------------------xxxxxxxxxxxxxxx-----------------------------
+#------------------xxxxxxxxxxxxx--------------------------------------
 
 class H5EpisodePathLengthsDataset(Dataset):
+    """
+    Flat frame-level dataset for shuffled training.
+
+    All per-frame data (node RLEs, pre-sliced path-length rows, instruction
+    tokens) are extracted from episode graphs **once at construction time**.
+    __getitem__ only reads the RGB image from HDF5, decodes masks, and
+    returns a ready-to-use sample dict — no graph loading at runtime.
+
+    This makes the dataset compatible with a standard shuffled DataLoader
+    without any per-batch graph-unpickling overhead.
+    """
+
     def __init__(self, h5_path: str, episode_ids: list = None):
         super().__init__()
-        self.h5_path= h5_path
-        self.clip_processor= CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
-        self._cached_ep_id: str = None
-        self._cached_ep_data: dict= None
+        self.h5_path = h5_path
+        self._h5: h5py.File = None   # opened lazily per DataLoader worker
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
 
         with h5py.File(h5_path, 'r') as hf:
             all_keys = sorted(hf.keys())
-            self.episode_ids = episode_ids if episode_ids is not None else all_keys
-            #all_keys#episode_ids if episode_ids is not None else all_keys
+            requested = episode_ids if episode_ids is not None else all_keys
+            valid_episodes = [ep for ep in requested
+                              if ep in hf and "frames" in hf[ep]]
 
-            self._ep_start = []
-            self._fr_local = []
-            self.episode_frame_counts = {}
+        # Flat index: one entry per (episode, frame).  Lightweight — no RGB.
+        # Each entry stores the pre-sliced path_rows [K, G] and the list of
+        # raw RLE dicts so __getitem__ only needs to read RGB + decode masks.
+        self.frames: list[dict] = []
+        # Instruction tokens stored per-episode (shared across frames).
+        self._ep_tokens: dict[str, tuple] = {}  # ep_id -> (input_ids, attn_mask)
 
-            for ep in self.episode_ids:
-                try:
-                    ep_data= load_episode_from_hdf5(self.h5_path, ep)
-                except Exception:
-                    continue
-                n_frames = len(ep_data['frame_data'])
-                self.episode_frame_counts[ep] = n_frames
+        n_eps = len(valid_episodes)
+        n_skipped = 0
+        print(f"[H5EpisodePathLengthsDataset] indexing {n_eps} episodes …")
+        for ep_idx, ep_id in enumerate(valid_episodes):
+            try:
+                ep_data = load_episode_from_hdf5(h5_path, ep_id)
+            except Exception as exc:
+                n_skipped += 1
+                continue
 
-                for local_i, fd in enumerate(ep_data["frame_data"]):
-                    self._ep_start.append(ep)
-                    self._fr_local.append(local_i)
+            G         = ep_data['graph']
+            all_paths = G.graph.get('all_paths_lengths')
+            if all_paths is None:
+                n_skipped += 1
+                continue
 
-    def __len__(self):
-        return len(self._ep_start)
-    
-    def _get_episode(self, ep_id: str) -> dict:
-        """Load episode only when it changes (cache the current one)."""
-        if self._cached_ep_id != ep_id:
-            self._cached_ep_data = load_episode_from_hdf5(self.h5_path, ep_id)
-            self._cached_ep_id = ep_id
-        return self._cached_ep_data
-    
-    def __getitem__(self, idx):
-        ep_id= self._ep_start[idx]
-        local_frame_idx = self._fr_local[idx]
-        ep_data = self._get_episode(ep_id)
+            all_nodes   = list(G.nodes())
+            node_to_idx = {n: i for i, n in enumerate(all_nodes)}
 
-        G = ep_data['graph']
-        fd = ep_data['frame_data'][local_frame_idx]
-        frame_idx = int(fd['frame_idx'])
+            # Goal nodes = nodes belonging to the last frame of the episode.
+            all_frame_idxs = [G.nodes[n]['map'][0] for n in all_nodes]
+            goal_frame_idx = max(all_frame_idxs) if all_frame_idxs else 0
+            goal_node_ids  = [n for n in all_nodes
+                               if G.nodes[n]['map'][0] == goal_frame_idx]
+            goal_indices   = [node_to_idx[n] for n in goal_node_ids]
 
-        all_paths= G.graph.get("all_paths_lengths", None)
-        if all_paths is None:
-            raise KeyError(f"Episode {ep_id} missing 'all_paths_lengths'")
+            # Tokenise instruction once and store keyed by ep_id.
+            if ep_id not in self._ep_tokens:
+                tok = self.clip_processor(
+                    text=ep_data.get('instruction', ''),
+                    padding='max_length', truncation=True,
+                    max_length=77, return_tensors='pt',
+                )
+                self._ep_tokens[ep_id] = (
+                    tok['input_ids'].squeeze(0),
+                    tok['attention_mask'].squeeze(0),
+                )
 
-        all_nodes = list(G.nodes())
-        node_to_idx = {n: i for i, n in enumerate(all_nodes)}
-        frame_node_ids = [n for n in all_nodes if G.nodes[n]['map'][0] == frame_idx]
-        indices = [node_to_idx[n] for n in frame_node_ids]
+            # Group nodes by frame index.
+            frame_to_nodes: dict = {}
+            for n in all_nodes:
+                frame_to_nodes.setdefault(G.nodes[n]['map'][0], []).append(n)
 
-        if indices:
-            path_rows = all_paths[np.ix_(indices, indices)].astype(np.float32)
-        else:
-            path_rows = np.zeros((0, 0), dtype=np.float32)
+            for frame_idx, nodes in frame_to_nodes.items():
+                indices = [node_to_idx[n] for n in nodes]
+                if indices and goal_indices:
+                    path_rows = all_paths[np.ix_(indices, goal_indices)].astype(np.float32)
+                else:
+                    path_rows = np.zeros((len(indices), 0), dtype=np.float32)
 
-        rgb = fd['rgb']
+                self.frames.append({
+                    'ep_id':     ep_id,
+                    'frame_idx': int(frame_idx),
+                    'rle_list':  [G.nodes[n].get('segmentation') for n in nodes],
+                    'path_rows': path_rows,        # [K, G] float32 — pre-sliced
+                })
+
+            if (ep_idx + 1) % 500 == 0 or ep_idx + 1 == n_eps:
+                print(f"  {ep_idx + 1}/{n_eps} episodes indexed "
+                      f"({len(self.frames)} frames) …")
+
+        print(f"[H5EpisodePathLengthsDataset] ready — {len(self.frames)} frames "
+              f"from {n_eps - n_skipped} episodes "
+              f"({n_skipped} skipped — missing all_paths_lengths)")
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def _open_h5(self) -> h5py.File:
+        """Open the HDF5 file lazily (once per DataLoader worker process)."""
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5_path, 'r')
+        return self._h5
+
+    def __getitem__(self, idx: int) -> dict:
+        meta      = self.frames[idx]
+        ep_id     = meta['ep_id']
+        frame_idx = meta['frame_idx']
+        rle_list  = meta['rle_list']
+        path_rows = meta['path_rows']           # [K, G] float32
+
+        # Only HDF5 I/O at runtime — no graph loading.
+        h5  = self._open_h5()
+        rgb = h5[ep_id]["frames"][f"{frame_idx:03d}"]["rgb"][()]
         H, W = rgb.shape[:2]
 
+        # Decode per-node masks from stored RLE dicts.
         masks_list = []
-        for n in frame_node_ids:
-            rle = G.nodes[n].get('segmentation')
+        for rle in rle_list:
             if rle is None:
                 masks_list.append(np.zeros((H, W), dtype=bool))
                 continue
             try:
-                # ── structural validation ──────────────────────────────────
-                if not isinstance(rle, dict) or 'counts' not in rle:
-                    raise ValueError(
-                        f"Node {n}: RLE missing 'counts' field. Got type={type(rle)}"
-                    )
-                if 'size' not in rle:
-                    raise ValueError(
-                        f"Node {n}: RLE missing 'size' field. counts type={type(rle['counts'])}"
-                    )
-
+                if not isinstance(rle, dict) or 'counts' not in rle or 'size' not in rle:
+                    raise ValueError(f"Malformed RLE: {type(rle)}")
                 counts = rle['counts']
-
-                # ── type coercion: pycocotools C code needs bytes, not str ─
                 if isinstance(counts, str):
-                    import warnings
-                    warnings.warn(
-                        f"Node {n}: RLE 'counts' is str, expected bytes — coercing. "
-                        f"This may indicate a serialisation bug in the dataset generator.",
-                        RuntimeWarning, stacklevel=2,
-                    )
                     counts = counts.encode('utf-8')
-                    rle = {'size': rle['size'], 'counts': counts}
-
-                # ── size mismatch: clamp to actual frame dims ─────────────
                 rle_h, rle_w = int(rle['size'][0]), int(rle['size'][1])
-                if rle_h != H or rle_w != W:
-                    import warnings
-                    warnings.warn(
-                        f"Node {n}: RLE size ({rle_h}×{rle_w}) != frame size "
-                        f"({H}×{W}). Overriding — mask may be incorrect.",
-                        RuntimeWarning, stacklevel=2,
-                    )
-                    rle = {'size': [H, W], 'counts': counts}
-
-                # ── decode (list API is more robust than single-dict path) ─
-                comp = mask_utils.frPyObjects([rle], H, W)
+                rle_use = {'size': [H, W] if (rle_h != H or rle_w != W) else rle['size'],
+                           'counts': counts}
+                comp = mask_utils.frPyObjects([rle_use], H, W)
                 dec  = mask_utils.decode(comp)
                 m    = (dec[..., 0] if dec.ndim == 3 else dec).astype(bool)
-
-            except Exception as _rle_exc:
-                # Log the problem but never kill the training process.
+            except Exception as exc:
                 import warnings
-                warnings.warn(
-                    f"Node {n}: mask decode failed — using zero mask. "
-                    f"Reason: {type(_rle_exc).__name__}: {_rle_exc}",
-                    RuntimeWarning, stacklevel=2,
-                )
+                warnings.warn(f"mask decode failed — zero mask. {type(exc).__name__}: {exc}",
+                              RuntimeWarning, stacklevel=2)
                 m = np.zeros((H, W), dtype=bool)
             masks_list.append(m)
 
         masks_arr = np.stack(masks_list) if masks_list else np.zeros((0, H, W), dtype=bool)
-        node_registry = {
-        node_id: NodeEntry(
-            node_id  = node_id,
-            mask     = masks_arr[k],
-            path_row = path_rows[k],
-        )
-        for k, node_id in enumerate(frame_node_ids)
+
+        # Normalised GT costs: min path length to nearest goal node → [0, 1].
+        K = masks_arr.shape[0]
+        if K > 0 and path_rows.shape[1] > 0:
+            raw_costs = np.nanmean(path_rows.astype(np.float64), axis=1)  # [K]
+        else:
+            raw_costs = np.full(K, np.nan, dtype=np.float64)
+        finite_mask = np.isfinite(raw_costs)
+        if finite_mask.sum() > 1:
+            c_min = float(raw_costs[finite_mask].min())
+            c_max = float(raw_costs[finite_mask].max())
+            if c_max > c_min:
+                gt_costs = np.where(finite_mask, (raw_costs - c_min) / (c_max - c_min), np.nan)
+            else:
+                gt_costs = np.where(finite_mask, 0.0, np.nan)
+        else:
+            gt_costs = np.zeros(K, dtype=np.float64)
+
+        pil_img      = Image.fromarray(rgb.astype(np.uint8))
+        pixel_values = self.clip_processor(
+            images=pil_img, return_tensors='pt')['pixel_values'].squeeze(0)
+
+        input_ids, attn_mask = self._ep_tokens[ep_id]
+        return {
+            'episode_id':     ep_id,
+            'frame_idx':      frame_idx,
+            'frame_rgb':      rgb,                                             # [H, W, 3] uint8
+            'pixel_values':   pixel_values,                                   # [3, 224, 224]
+            'masks':          torch.from_numpy(masks_arr).bool(),             # [K, H, W]
+            'gt_costs':       torch.from_numpy(gt_costs.astype(np.float32)), # [K]
+            'input_ids':      input_ids,                                      # [77]
+            'attention_mask': attn_mask,                                      # [77]
         }
 
-        pil_img = Image.fromarray(rgb.astype(np.uint8))
-        clip_img_out = self.clip_processor(images=pil_img, return_tensors='pt')
-        pixel_values = clip_img_out['pixel_values'].squeeze(0)
 
-        clip_text = self.clip_processor(
-        text=ep_data.get('instruction', ''),
-        padding='max_length', truncation=True,
-        max_length=77, return_tensors='pt',
-        )
+def create_h5_episode_pathlengths_dataloader(
+    h5_path: str,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    val_split: float = 0.2,
+    seed: int = 42,
+) -> tuple:
+    """
+    Build train and val DataLoaders from a single HDF5 file.
 
-        return {
-        'episode_id':     ep_id,
-        'frame_idx':      frame_idx,
-        'frame_rgb':      rgb,
-        'pixel_values':   pixel_values,
-        "node_registry":  node_registry,
-        "frame_node_ids":  frame_node_ids,
-        'input_ids':      clip_text['input_ids'].squeeze(0),
-        'attention_mask': clip_text['attention_mask'].squeeze(0),
-        'node_to_idx':    node_to_idx, 
-    }
-
-
-def create_h5_episode_pathlengths_dataloader(h5_path: str, batch_size: int = 4, shuffle: bool = False, num_workers: int = 0, val_split: float= 0.2, seed: int = 42,):
+    Episodes are split at the episode level (not frame level), then all frames
+    from each split form a flat dataset that is shuffled independently per epoch.
+    Each sample carries the correct (image, masks, gt_costs, instruction) tuple
+    from the same episode.
+    """
     with h5py.File(h5_path, 'r') as hf:
-        all_keys = sorted(hf.keys())[:10]
+        all_keys = sorted(hf.keys())
 
-    # Shuffle and split at episode level
     rng = random.Random(seed)
     keys = list(all_keys)
     rng.shuffle(keys)
-
     split_idx = int(len(keys) * (1 - val_split))
     train_ids = keys[:split_idx]
     val_ids   = keys[split_idx:]
 
     train_ds = H5EpisodePathLengthsDataset(h5_path, episode_ids=train_ids)
-    val_ds= H5EpisodePathLengthsDataset(h5_path, episode_ids= val_ids)
-    def h5_episode_pathlengths_collate_fn(batch: list[dict]) -> dict:
-        """Collate: stack token tensors, keep variable-length masks/path_rows as lists."""
+    val_ds   = H5EpisodePathLengthsDataset(h5_path, episode_ids=val_ids)
+
+    def _collate(batch: list[dict]) -> dict:
         return {
-            "pixel_values":    torch.stack([b["pixel_values"] for b in batch]),
-            "input_ids":       torch.stack([b["input_ids"] for b in batch]),
-            "attention_mask":  torch.stack([b["attention_mask"] for b in batch]),
-            "frame_rgbs":      [b["frame_rgb"] for b in batch],
-            "episode_ids":     [b["episode_id"] for b in batch],
-            "frame_idxs":      [b["frame_idx"] for b in batch],
-            "node_registries":  [b["node_registry"] for b in batch],
-            "node_to_idx":      [b["node_to_idx"] for b in batch],
-            "frame_node_ids":   [b["frame_node_ids"] for b in batch],
+            "pixel_values":  torch.stack([b["pixel_values"]   for b in batch]),
+            "input_ids":     torch.stack([b["input_ids"]      for b in batch]),
+            "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+            "masks_list":    [b["masks"]    for b in batch],
+            "gt_costs_list": [b["gt_costs"] for b in batch],
+            "frame_rgbs":    [b["frame_rgb"] for b in batch],
+            "episode_ids":   [b["episode_id"] for b in batch],
+            "frame_idxs":    [b["frame_idx"]  for b in batch],
         }
-    train_loader= DataLoader(train_ds, batch_size=batch_size,shuffle=shuffle,
-                             num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,
-                             pin_memory=True, persistent_workers=(num_workers > 0))
-    val_loader= DataLoader(val_ds, batch_size=batch_size,shuffle=False,
-                             num_workers=num_workers,collate_fn=h5_episode_pathlengths_collate_fn,
-                             pin_memory=True, persistent_workers=(num_workers > 0))
+
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        collate_fn=_collate,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=True,  drop_last=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+                              shuffle=False, drop_last=False, **loader_kwargs)
+    return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# LMDB-backed dataset: fast random-access for large-scale training
+# ---------------------------------------------------------------------------
+
+def convert_h5_to_lmdb(
+    h5_path: str,
+    lmdb_path: str,
+    clip_model_name: str = "openai/clip-vit-base-patch16",
+    jpeg_quality: int = 95,
+    map_size_gb: float = 200.0,
+) -> None:
+    """
+    Pre-process every frame in an HDF5 episode file and write the results
+    into an LMDB database for fast, random-access batch loading.
+
+    All slow operations (graph unpickling, path-length slicing, CLIP
+    tokenisation) are done **once here**, so that LMDBEpisodePathLengthsDataset
+    __getitem__ only needs to do a single LMDB read, a JPEG decode, and mask
+    decoding — no Python graph objects at training time.
+
+    LMDB layout
+    -----------
+    Key                          Value (pickle)
+    -------------------------    -----------------------------------------------
+    b"__keys__"                  list[bytes] — sorted list of all frame keys
+    b"{ep_id}/{frame_idx:03d}"   dict with fields:
+                                   ep_id          : str
+                                   frame_idx      : int
+                                   rgb_jpeg       : bytes  (JPEG-encoded RGB)
+                                   rle_list       : list[dict | None]
+                                   path_rows      : bytes  (float32 ndarray,
+                                                           shape [K, G])
+                                   path_rows_shape: tuple  (K, G)
+                                   input_ids      : bytes  (int32 ndarray [77])
+                                   attention_mask : bytes  (int32 ndarray [77])
+
+    Parameters
+    ----------
+    h5_path        : Path to the source HDF5 file.
+    lmdb_path      : Destination directory for the LMDB database.
+    clip_model_name: HuggingFace CLIP model used for text tokenisation.
+    jpeg_quality   : JPEG quality (1-95) used to compress RGB frames.
+    map_size_gb    : LMDB virtual map size in GB.  On Linux this is only
+                     virtual address space — actual disk usage is much smaller.
+    """
+    import io as _io
+    import pickle as _pickle
+    import lmdb
+
+    clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
+    map_size = int(map_size_gb * (1 << 30))
+
+    with h5py.File(h5_path, 'r') as hf, \
+         lmdb.open(lmdb_path, map_size=map_size, subdir=True, meminit=False,
+                   map_async=True) as env:
+
+        all_ep_ids = sorted(hf.keys())
+        n_eps      = len(all_ep_ids)
+        all_keys: list = []
+
+        print(f"[convert_h5_to_lmdb] converting {n_eps} episodes …")
+        n_skipped = 0
+
+        for ep_idx, ep_id in enumerate(all_ep_ids):
+            ep_grp = hf[ep_id]
+
+            # -- instruction tokens (shared across all frames) ---------------
+            raw_instr = ep_grp["instruction"][()]
+            instruction = raw_instr.decode("utf-8") if isinstance(raw_instr, bytes) \
+                          else str(raw_instr)
+            tok = clip_processor(
+                text=instruction,
+                padding='max_length', truncation=True,
+                max_length=77, return_tensors='pt',
+            )
+            input_ids_np     = tok['input_ids'].squeeze(0).numpy().astype(np.int32)
+            attn_mask_np     = tok['attention_mask'].squeeze(0).numpy().astype(np.int32)
+            input_ids_bytes  = input_ids_np.tobytes()
+            attn_mask_bytes  = attn_mask_np.tobytes()
+
+            # -- graph: unpickle once per episode ----------------------------
+            if "graph" not in ep_grp:
+                n_skipped += 1
+                continue
+            try:
+                import pickle as _pickle_inner
+                graph_bytes = ep_grp["graph"][()].tobytes()
+                G           = _pickle_inner.loads(graph_bytes)
+            except Exception:
+                n_skipped += 1
+                continue
+
+            all_paths = G.graph.get('all_paths_lengths')
+            if all_paths is None:
+                n_skipped += 1
+                continue
+
+            all_nodes   = list(G.nodes())
+            node_to_idx = {n: i for i, n in enumerate(all_nodes)}
+
+            all_frame_idxs = [G.nodes[n]['map'][0] for n in all_nodes]
+            goal_frame_idx = max(all_frame_idxs) if all_frame_idxs else 0
+            goal_indices   = [node_to_idx[n] for n in all_nodes
+                              if G.nodes[n]['map'][0] == goal_frame_idx]
+
+            # group nodes by frame index
+            frame_to_nodes: dict = {}
+            for nd in all_nodes:
+                frame_to_nodes.setdefault(G.nodes[nd]['map'][0], []).append(nd)
+
+            with env.begin(write=True) as txn:
+                for frame_idx, nodes in frame_to_nodes.items():
+                    frame_key_str = f"{ep_id}/{frame_idx:03d}"
+                    frame_key     = frame_key_str.encode('utf-8')
+
+                    # -- RGB: read from HDF5 and JPEG-compress ---------------
+                    h5_frame_key = f"{frame_idx:03d}"
+                    if h5_frame_key not in ep_grp["frames"]:
+                        continue
+                    rgb = ep_grp["frames"][h5_frame_key]["rgb"][()]
+                    pil_img = Image.fromarray(rgb.astype(np.uint8))
+                    jpeg_buf = _io.BytesIO()
+                    pil_img.save(jpeg_buf, format='JPEG', quality=jpeg_quality)
+                    rgb_jpeg = jpeg_buf.getvalue()
+
+                    # -- path_rows: slice [K, G] -----------------------------
+                    indices = [node_to_idx[n] for n in nodes]
+                    if indices and goal_indices:
+                        path_rows = all_paths[
+                            np.ix_(indices, goal_indices)
+                        ].astype(np.float32)
+                    else:
+                        path_rows = np.zeros(
+                            (len(indices), 0), dtype=np.float32)
+
+                    # -- RLE list --------------------------------------------
+                    rle_list = [G.nodes[n].get('segmentation') for n in nodes]
+
+                    record = {
+                        'ep_id':           ep_id,
+                        'frame_idx':       int(frame_idx),
+                        'rgb_jpeg':        rgb_jpeg,
+                        'rle_list':        rle_list,
+                        'path_rows':       path_rows.tobytes(),
+                        'path_rows_shape': path_rows.shape,
+                        'input_ids':       input_ids_bytes,
+                        'attention_mask':  attn_mask_bytes,
+                    }
+                    txn.put(frame_key, _pickle.dumps(record, protocol=4))
+                    all_keys.append(frame_key)
+
+            if (ep_idx + 1) % 50 == 0 or ep_idx + 1 == n_eps:
+                print(f"  {ep_idx + 1}/{n_eps} episodes  "
+                      f"({len(all_keys)} frames written) …")
+
+        # write the key index
+        with env.begin(write=True) as txn:
+            txn.put(b"__keys__", _pickle.dumps(sorted(all_keys), protocol=4))
+
+    print(f"[convert_h5_to_lmdb] done — {len(all_keys)} frames "
+          f"from {n_eps - n_skipped} episodes written to {lmdb_path} "
+          f"({n_skipped} episodes skipped)")
+
+
+class LMDBEpisodePathLengthsDataset(Dataset):
+    """
+    Drop-in replacement for H5EpisodePathLengthsDataset that reads from LMDB.
+
+    __getitem__ only does:
+      1. One LMDB key lookup (memory-mapped, near-zero latency)
+      2. JPEG decode → CLIP pixel_values
+      3. pycocotools RLE mask decode
+
+    All graph loading and path-length slicing was performed once at
+    conversion time by convert_h5_to_lmdb().
+
+    Returns the same dict schema as H5EpisodePathLengthsDataset.
+    """
+
+    def __init__(self, lmdb_path: str, episode_ids: list = None):
+        super().__init__()
+        import pickle as _pickle
+        import lmdb
+
+        self.lmdb_path      = lmdb_path
+        self._env           = None   # opened lazily per DataLoader worker
+        self.clip_processor = CLIPProcessor.from_pretrained(
+            "openai/clip-vit-base-patch16")
+
+        # Load the key index from LMDB (read-only, main process).
+        env = lmdb.open(lmdb_path, readonly=True, lock=False,
+                        readahead=False, meminit=False)
+        with env.begin(write=False) as txn:
+            raw = txn.get(b"__keys__")
+            if raw is None:
+                raise RuntimeError(
+                    f"LMDB at {lmdb_path} has no '__keys__' entry. "
+                    "Run convert_h5_to_lmdb() first.")
+            all_keys: list = _pickle.loads(raw)   # list[bytes]
+        env.close()
+
+        # Filter by requested episode_ids if provided.
+        if episode_ids is not None:
+            ep_set = set(str(e) for e in episode_ids)
+            all_keys = [k for k in all_keys
+                        if k.decode('utf-8').split('/')[0] in ep_set]
+
+        self._keys = all_keys   # list[bytes]
+        if episode_ids is None:
+            ep_desc = "all episodes"
+        else:
+            n_ep = len({k.decode('utf-8').split('/')[0] for k in self._keys})
+            ep_desc = f"{n_ep} episodes"
+        print(f"[LMDBEpisodePathLengthsDataset] {len(self._keys)} frames ({ep_desc})")
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def _open_env(self):
+        """Open LMDB lazily once per DataLoader worker (fork-safe)."""
+        if self._env is None:
+            import lmdb
+            self._env = lmdb.open(
+                self.lmdb_path,
+                readonly=True, lock=False,
+                readahead=False, meminit=False,
+            )
+        return self._env
+
+    def __getitem__(self, idx: int) -> dict:
+        import pickle as _pickle
+        import io as _io
+
+        key    = self._keys[idx]
+        env    = self._open_env()
+        with env.begin(write=False) as txn:
+            raw = txn.get(key)
+        if raw is None:
+            raise KeyError(f"LMDB key {key} not found")
+        rec = _pickle.loads(raw)
+
+        ep_id     = rec['ep_id']
+        frame_idx = rec['frame_idx']
+        rle_list  = rec['rle_list']
+
+        # -- JPEG decode → CLIP pixel_values ---------------------------------
+        pil_img      = Image.open(_io.BytesIO(rec['rgb_jpeg'])).convert('RGB')
+        H, W         = pil_img.height, pil_img.width
+        pixel_values = self.clip_processor(
+            images=pil_img, return_tensors='pt')['pixel_values'].squeeze(0)
+
+        # -- decode RLE masks ------------------------------------------------
+        masks_list = []
+        for rle in rle_list:
+            if rle is None:
+                masks_list.append(np.zeros((H, W), dtype=bool))
+                continue
+            try:
+                if not isinstance(rle, dict) or 'counts' not in rle or 'size' not in rle:
+                    raise ValueError(f"Malformed RLE: {type(rle)}")
+                counts = rle['counts']
+                if isinstance(counts, str):
+                    counts = counts.encode('utf-8')
+                elif isinstance(counts, list):
+                    # plain list RLE → COCO frPyObjects expects list-of-counts
+                    pass
+                rle_h, rle_w = int(rle['size'][0]), int(rle['size'][1])
+                rle_use = {
+                    'size':   [H, W] if (rle_h != H or rle_w != W) else rle['size'],
+                    'counts': counts,
+                }
+                comp = mask_utils.frPyObjects([rle_use], H, W)
+                dec  = mask_utils.decode(comp)
+                m    = (dec[..., 0] if dec.ndim == 3 else dec).astype(bool)
+            except Exception as exc:
+                import warnings
+                warnings.warn(
+                    f"mask decode failed — zero mask. {type(exc).__name__}: {exc}",
+                    RuntimeWarning, stacklevel=2)
+                m = np.zeros((H, W), dtype=bool)
+            masks_list.append(m)
+
+        masks_arr = np.stack(masks_list) if masks_list \
+                    else np.zeros((0, H, W), dtype=bool)
+        K = masks_arr.shape[0]
+
+        # -- GT costs from pre-sliced path_rows ------------------------------
+        K_stored, G_stored = rec['path_rows_shape']
+        path_rows = np.frombuffer(rec['path_rows'], dtype=np.float32) \
+                      .reshape(K_stored, G_stored)
+
+        if K > 0 and path_rows.shape[1] > 0:
+            raw_costs = np.nanmin(path_rows.astype(np.float64), axis=1)  # [K]
+        else:
+            raw_costs = np.full(K, np.nan, dtype=np.float64)
+
+        finite = np.isfinite(raw_costs)
+        if finite.sum() > 1:
+            c_min, c_max = float(raw_costs[finite].min()), float(raw_costs[finite].max())
+            if c_max > c_min:
+                gt_costs = np.where(finite, (raw_costs - c_min) / (c_max - c_min), np.nan)
+            else:
+                gt_costs = np.where(finite, 0.0, np.nan)
+        else:
+            gt_costs = np.zeros(K, dtype=np.float64)
+
+        # -- instruction tokens (pre-computed, stored as raw bytes) ----------
+        input_ids  = torch.from_numpy(
+            np.frombuffer(rec['input_ids'],    dtype=np.int32).copy()).long()
+        attn_mask  = torch.from_numpy(
+            np.frombuffer(rec['attention_mask'], dtype=np.int32).copy()).long()
+
+        frame_rgb = np.array(pil_img)  # [H, W, 3] uint8 — for visualisation
+
+        return {
+            'episode_id':     ep_id,
+            'frame_idx':      frame_idx,
+            'frame_rgb':      frame_rgb,                                       # [H, W, 3] uint8
+            'pixel_values':   pixel_values,                                    # [3, 224, 224]
+            'masks':          torch.from_numpy(masks_arr).bool(),              # [K, H, W]
+            'gt_costs':       torch.from_numpy(gt_costs.astype(np.float32)),  # [K]
+            'input_ids':      input_ids,                                       # [77]
+            'attention_mask': attn_mask,                                       # [77]
+        }
+
+
+def create_lmdb_episode_pathlengths_dataloader(
+    lmdb_path: str,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    val_split: float = 0.2,
+    seed: int = 42,
+) -> tuple:
+    """
+    Build train and val DataLoaders from an LMDB database produced by
+    convert_h5_to_lmdb().
+
+    Episodes are split at the episode level so no frame leaks between splits.
+    Returns (train_loader, val_loader).
+    """
+    import pickle as _pickle
+    import lmdb
+
+    # Enumerate all unique episode IDs from the LMDB key index.
+    env = lmdb.open(lmdb_path, readonly=True, lock=False,
+                    readahead=False, meminit=False)
+    with env.begin(write=False) as txn:
+        all_keys: list = _pickle.loads(txn.get(b"__keys__"))
+    env.close()
+
+    all_ep_ids = sorted({k.decode('utf-8').split('/')[0] for k in all_keys})
+    rng = random.Random(seed)
+    ep_ids = list(all_ep_ids)
+    rng.shuffle(ep_ids)
+    split_idx = int(len(ep_ids) * (1 - val_split))
+    train_ids = ep_ids[:split_idx]
+    val_ids   = ep_ids[split_idx:]
+
+    train_ds = LMDBEpisodePathLengthsDataset(lmdb_path, episode_ids=train_ids)
+    val_ds   = LMDBEpisodePathLengthsDataset(lmdb_path, episode_ids=val_ids)
+
+    def _collate(batch: list[dict]) -> dict:
+        return {
+            "pixel_values":   torch.stack([b["pixel_values"]    for b in batch]),
+            "input_ids":      torch.stack([b["input_ids"]       for b in batch]),
+            "attention_mask": torch.stack([b["attention_mask"]  for b in batch]),
+            "masks_list":     [b["masks"]    for b in batch],
+            "gt_costs_list":  [b["gt_costs"] for b in batch],
+            "frame_rgbs":     [b["frame_rgb"] for b in batch],
+            "episode_ids":    [b["episode_id"] for b in batch],
+            "frame_idxs":     [b["frame_idx"]  for b in batch],
+        }
+
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        collate_fn=_collate,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=True,  drop_last=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+                              shuffle=False, drop_last=False, **loader_kwargs)
     return train_loader, val_loader

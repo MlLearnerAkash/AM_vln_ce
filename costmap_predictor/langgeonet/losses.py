@@ -28,7 +28,9 @@ class GeodesicRegressionLoss(nn.Module):
         for pred, gt in zip(predictions, targets):
             if pred.numel() == 0:
                 continue
-            total_loss += F.smooth_l1_loss(pred, gt, beta=self.beta, reduction='sum')
+            # Predictions are raw logits; apply sigmoid before regression.
+            total_loss += F.smooth_l1_loss(
+                torch.sigmoid(pred), gt, beta=self.beta, reduction='sum')
             total_objects += pred.numel()
 
         if total_objects == 0:
@@ -42,7 +44,7 @@ class OrdinalRankingLoss(nn.Module):
     Uses hard negative mining for efficiency.
     """
 
-    def __init__(self, margin=0.05, hard_fraction=0.5):
+    def __init__(self, margin=0.3, hard_fraction=0.5):
         super().__init__()
         self.margin = margin
         self.hard_fraction = hard_fraction
@@ -105,7 +107,8 @@ class ScaleInvariantLogLoss(nn.Module):
             if pred.numel() == 0:
                 continue
 
-            log_pred = torch.log(pred.clamp(min=self.eps))
+            # Predictions are raw logits; apply sigmoid before log-space loss.
+            log_pred = torch.log(torch.sigmoid(pred).clamp(min=self.eps))
             log_gt = torch.log(gt.clamp(min=self.eps))
             diff = log_pred - log_gt
 
@@ -117,31 +120,164 @@ class ScaleInvariantLogLoss(nn.Module):
         return total_loss / count
 
 
+class PredictionDiversityLoss(nn.Module):
+    """
+    Penalise near-constant predictions within a single frame.
+
+    Computes the std-dev of sigmoid(predictions) across all valid objects in
+    each frame and penalises if it falls below `min_std`.  This provides a
+    direct gradient signal to break the same-prediction collapse mode.
+    """
+
+    def __init__(self, min_std: float = 0.10):
+        super().__init__()
+        self.min_std = min_std
+
+    def forward(self, predictions) -> torch.Tensor:
+        loss  = torch.tensor(0.0, device=predictions[0].device)
+        count = 0
+        for pred in predictions:
+            if pred.shape[0] < 2:
+                continue
+            std   = torch.sigmoid(pred).std()
+            loss  = loss + F.relu(self.min_std - std)
+            count += 1
+        return loss / max(count, 1)
+
+
+class ListNetRankingLoss(nn.Module):
+    """
+    ListNet top-1 approximation: cross-entropy between the predicted and
+    ground-truth softmax score distributions.
+
+    Works on raw logits — no sigmoid needed.  Lower GT value = higher
+    probability (gt scores are costs, so we invert them).
+    """
+
+    def forward(self, predictions, targets):
+        total_loss = 0.0
+        count = 0
+
+        for pred, gt in zip(predictions, targets):
+            K = pred.shape[0]
+            if K < 2:
+                continue
+            # Invert costs so lower-cost objects get higher probability mass.
+            true_probs = F.softmax(-gt,   dim=0)   # [K]
+            pred_log   = F.log_softmax(pred, dim=0) # [K]
+            total_loss -= (true_probs * pred_log).sum()
+            count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=predictions[0].device, requires_grad=True)
+        return total_loss / count
+
+
 class LangGeoNetLoss(nn.Module):
     """
     Combined loss:
-        L = L_reg + lambda_rank * L_rank + lambda_si * L_si
+        L = L_reg  +  lambda_rank * (L_ordinal + L_listnet) / 2
+              +  lambda_si   * L_si
+              +  lambda_div  * L_diversity           (breaks same-prediction mode)
+              +  lambda_aux  * (L_reg_geo + L_ordinal_geo)   (auxiliary on cost_head)
     """
 
-    def __init__(self, lambda_rank=0.5, lambda_si=0.3):
+    def __init__(self, lambda_rank=0.5, lambda_si=0.3, lambda_aux=0.5,
+                 lambda_div=0.5):
         super().__init__()
         self.lambda_rank = lambda_rank
-        self.lambda_si = lambda_si
-        self.regression = GeodesicRegressionLoss()
-        self.ranking = OrdinalRankingLoss()
-        self.scale_inv = ScaleInvariantLogLoss()
+        self.lambda_si   = lambda_si
+        self.lambda_aux  = lambda_aux
+        self.lambda_div  = lambda_div
+        self.regression  = GeodesicRegressionLoss()
+        self.ranking     = OrdinalRankingLoss()
+        self.listnet     = ListNetRankingLoss()
+        self.scale_inv   = ScaleInvariantLogLoss()
+        self.diversity   = PredictionDiversityLoss()
 
-    def forward(self, predictions, targets):
-        l_reg = self.regression(predictions, targets)
+    def forward(self, predictions, targets, geo_preds=None):
+        l_reg  = self.regression(predictions, targets)
         l_rank = self.ranking(predictions, targets)
-        l_si = self.scale_inv(predictions, targets)
+        l_list = self.listnet(predictions, targets)
+        l_si   = self.scale_inv(predictions, targets)
+        l_div  = self.diversity(predictions)
 
-        total = l_reg + self.lambda_rank * l_rank + self.lambda_si * l_si
+        total = (l_reg
+                 + self.lambda_rank * (l_rank + l_list) / 2.0
+                 + self.lambda_si   * l_si
+                 + self.lambda_div  * l_div)
+
+        # Auxiliary supervision directly on the cost head (pre-refinement logits).
+        l_aux = torch.tensor(0.0, device=l_reg.device)
+        if geo_preds is not None and self.lambda_aux > 0:
+            l_aux = (self.regression(geo_preds, targets)
+                     + self.ranking(geo_preds, targets)
+                     + self.diversity(geo_preds))
+            total = total + self.lambda_aux * l_aux
 
         loss_dict = {
-            "loss_total": total.item(),
-            "loss_regression": l_reg.item(),
-            "loss_ranking": l_rank.item(),
+            "loss_total":           total.item(),
+            "loss_regression":      l_reg.item(),
+            "loss_ranking":         l_rank.item(),
+            "loss_listnet":         l_list.item(),
             "loss_scale_invariant": l_si.item(),
+            "loss_diversity":       l_div.item(),
+            "loss_aux_geo":         l_aux.item(),
         }
         return total, loss_dict
+
+
+def instruction_sensitivity_loss(
+    model,
+    pixel_values: torch.Tensor,
+    masks_list: list,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    predictions: list,
+) -> torch.Tensor:
+    """
+    Penalise the model for producing *similar* predictions when the instruction
+    is swapped with a different sample's instruction from the same batch.
+
+    Margin loss: push the per-sample MSE between original and negative
+    predictions above a margin of 0.5.  If they are already more than 0.5
+    apart, no penalty is applied.
+
+    Within-batch permutation creates hard negatives cheaply without extra data.
+    A random (non-identity) permutation is used so different pairs are seen
+    across training steps.
+
+    Returns a scalar loss.  Add it to the main loss weighted by ~0.3.
+    """
+    B = input_ids.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=input_ids.device)
+
+    # Random permutation guaranteed to have no fixed points (derangement approx)
+    perm = torch.randperm(B, device=input_ids.device)
+    # If any position maps to itself, do a single cyclic shift of those slots
+    identity = perm == torch.arange(B, device=input_ids.device)
+    if identity.any():
+        idx = identity.nonzero(as_tuple=True)[0]
+        perm[idx] = perm[idx.roll(1)]
+
+    neg_input_ids      = input_ids[perm]
+    neg_attention_mask = attention_mask[perm]
+
+    with torch.no_grad():
+        neg_preds, _ = model(pixel_values, masks_list,
+                             neg_input_ids, neg_attention_mask)
+
+    loss = torch.tensor(0.0, device=input_ids.device)
+    n = 0
+    for orig, neg in zip(predictions, neg_preds):
+        if orig.numel() < 1:
+            continue
+        # Compare in sigmoid (probability) space so the margin is scale-invariant.
+        orig_sig = torch.sigmoid(orig.float())
+        neg_sig  = torch.sigmoid(neg.float().detach())
+        mse      = F.mse_loss(orig_sig, neg_sig)
+        loss    += F.relu(0.05 - mse)   # margin in probability space
+        n       += 1
+
+    return loss / max(n, 1)

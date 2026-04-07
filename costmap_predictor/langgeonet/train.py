@@ -15,8 +15,8 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.stats import spearmanr
 
-from model import build_langgeonet
-from dataset import create_h5_episode_pathlengths_dataloader
+from model import LangGeoNetV2
+from dataset import create_h5_episode_pathlengths_dataloader, create_lmdb_episode_pathlengths_dataloader
 from losses import LangGeoNetLoss
 
 try:
@@ -31,61 +31,51 @@ logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------
+# Gradient-norm helpers
+# -------------------------------------------------------
+
+_LANG_PREFIXES   = ("clip.text_model", "lang_proj")
+_VISION_PREFIXES = ("clip.vision_model", "dino", "clip_vis_proj", "dino_vis_proj")
+
+
+def _compute_branch_grad_norms(model: nn.Module) -> dict:
+    """
+    Return L2 gradient norms for the unfrozen language and vision branch
+    parameters (those for which requires_grad=True and grad is not None).
+
+    Returns a dict with keys:
+        'grad_norm/lang'   – CLIP text + lang_proj
+        'grad_norm/vision' – CLIP visual + DINOv2 + vis projections
+        'grad_norm/head'   – all other trainable parameters
+    """
+    sq = {"lang": 0.0, "vision": 0.0, "head": 0.0}
+    for name, p in model.named_parameters():
+        if not p.requires_grad or p.grad is None:
+            continue
+        norm_sq = p.grad.detach().float().norm(2).item() ** 2
+        if any(name.startswith(pfx) for pfx in _LANG_PREFIXES):
+            sq["lang"] += norm_sq
+        elif any(name.startswith(pfx) for pfx in _VISION_PREFIXES):
+            sq["vision"] += norm_sq
+        else:
+            sq["head"] += norm_sq
+    return {f"grad_norm/{k}": sq[k] ** 0.5 for k in sq}
+
+
+# -------------------------------------------------------
 # Batch adaptor  —  bridges dataloader → model interface
 # -------------------------------------------------------
 
 def _prepare_batch(batch: dict, device: torch.device):
     """
-    Convert a raw H5EpisodePathLengthsDataset batch into the tensors the
-    model and loss expect.
+    Move a pre-processed H5EpisodePathLengthsDataset batch to the target device.
+    Masks and GT costs are computed in __getitem__ (worker processes).
     """
     pixel_values = batch["pixel_values"].to(device)
-    input_ids  = batch["input_ids"].to(device)
-    attn_mask  = batch["attention_mask"].to(device)
-
-    masks_list, gts_list = [], []
-    for registry in batch["node_registries"]:
-        if not registry:
-            masks_list.append(torch.zeros(0, 1, 1, dtype=torch.bool, device=device))
-            gts_list.append(torch.zeros(0, dtype=torch.float32, device=device))
-            continue
-
-        node_ids   = list(registry.keys())
-        raw_costs  = []
-        masks      = []
-
-        for node_id in node_ids:
-            entry = registry[node_id]
-
-            pr   = np.asarray(entry.path_row, dtype=np.float64)
-            cost = float(np.nanmean(pr)) if pr.size else np.nan
-            raw_costs.append(cost)
-
-            m = entry.mask
-            try:
-                m = m.cpu().numpy()
-            except AttributeError:
-                m = np.asarray(m)
-            masks.append(m.astype(bool))
-
-        # ── per-frame min-max normalise to [0, 1] ────────────────────────────
-        finite  = [c for c in raw_costs if np.isfinite(c)]
-        c_min, c_max = (min(finite), max(finite)) if len(finite) > 1 else (0.0, 1.0)
-
-        costs = []
-        for c in raw_costs:
-            if not np.isfinite(c):
-                costs.append(np.nan)
-            elif c_max == c_min:
-                costs.append(0.0)
-            else:
-                costs.append((c - c_min) / (c_max - c_min))
-
-        masks_list.append(torch.from_numpy(np.stack(masks)).to(device))
-        gts_list.append(
-            torch.tensor(costs, dtype=torch.float32, device=device)
-        )
-
+    input_ids    = batch["input_ids"].to(device)
+    attn_mask    = batch["attention_mask"].to(device)
+    masks_list   = [m.to(device) for m in batch["masks_list"]]
+    gts_list     = [g.to(device) for g in batch["gt_costs_list"]]
     return pixel_values, input_ids, attn_mask, masks_list, gts_list
 
 
@@ -135,29 +125,10 @@ def compute_metrics(all_preds, all_gts):
 
 
 def _extract_sample_masks_and_rgb(batch, sample_idx):
-    """Return (frame_rgb, masks_arr, node_ids) for one sample in a collated batch.
-
-    Handles both `node_registries` + `frame_node_ids` and legacy `masks_arrs` formats.
-    """
+    """Return (frame_rgb, masks_arr, node_ids) for one sample in a collated batch."""
     frame_rgb = batch.get("frame_rgbs", [None])[sample_idx]
-
-    if "node_registries" in batch and "frame_node_ids" in batch:
-        node_registry = batch["node_registries"][sample_idx]
-        frame_node_ids = batch["frame_node_ids"][sample_idx]
-        H, W = int(frame_rgb.shape[0]), int(frame_rgb.shape[1])
-        if not frame_node_ids:
-            return frame_rgb, np.zeros((0, H, W), dtype=bool), []
-        masks = np.stack([node_registry[nid].mask for nid in frame_node_ids], axis=0)
-        return frame_rgb, masks, frame_node_ids
-
-    if "masks_arrs" in batch and "path_rows" in batch:
-        masks = batch["masks_arrs"][sample_idx]
-        # node ids may not be available in this legacy format
-        return frame_rgb, masks, list(range(masks.shape[0]))
-
-    # Fallback: empty
-    H, W = int(frame_rgb.shape[0]), int(frame_rgb.shape[1])
-    return frame_rgb, np.zeros((0, H, W), dtype=bool), []
+    masks_arr = batch["masks_list"][sample_idx].cpu().numpy()   # [K, H, W]
+    return frame_rgb, masks_arr, list(range(masks_arr.shape[0]))
 
 
 def _render_cost_comparison_image(frame_rgb, masks_arr, gt_costs, pred_costs, alpha=0.5):
@@ -286,31 +257,61 @@ def train_one_epoch(model, loader, criterion, optimizer, device,
     for i, batch in enumerate(loader):
         pixel_values, input_ids, attn_mask, masks_list, gts_list = \
             _prepare_batch(batch, device)
-        del batch 
         # skip frames where every registry was empty
         if all(m.shape[0] == 0 for m in masks_list):
             continue
 
-        cids = [None] * len(masks_list)
-        preds, _ = model(pixel_values, masks_list, cids, input_ids, attn_mask)
-        loss, ld = criterion(preds, gts_list)
+        preds, geo_preds, _ = model(pixel_values, masks_list, input_ids, attn_mask,
+                                     return_geo=True)
+        loss, ld = criterion(preds, gts_list, geo_preds=geo_preds)
+        ld["loss_total"] = loss.item()
         (loss / grad_accum).backward()
 
         if (i + 1) % grad_accum == 0:
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norms = _compute_branch_grad_norms(model)
+            # Clip backbone (lang+vision) and head separately so the larger head
+            # gradients don't force the backbone clip to fire every step.
+            backbone_params = [p for n, p in model.named_parameters()
+                               if p.requires_grad and p.grad is not None
+                               and (any(n.startswith(pfx) for pfx in _LANG_PREFIXES)
+                                    or any(n.startswith(pfx) for pfx in _VISION_PREFIXES))]
+            head_params_grad = [p for n, p in model.named_parameters()
+                                if p.requires_grad and p.grad is not None
+                                and not (any(n.startswith(pfx) for pfx in _LANG_PREFIXES)
+                                         or any(n.startswith(pfx) for pfx in _VISION_PREFIXES))]
+            nn.utils.clip_grad_norm_(backbone_params,  5.0)
+            nn.utils.clip_grad_norm_(head_params_grad, 1.0)
             optimizer.step()
             optimizer.zero_grad()
+            logger.debug(
+                f"  grad_norms — lang={grad_norms['grad_norm/lang']:.4f}  "
+                f"vision={grad_norms['grad_norm/vision']:.4f}  "
+                f"head={grad_norms['grad_norm/head']:.4f}"
+            )
             if wandb_run is not None:
-                wandb_run.log({f"train/{k}": v for k, v in ld.items()} | {"batch_step": global_step})
+                wandb_run.log(
+                    {f"train/{k}": v for k, v in ld.items()}
+                    | {f"train/{k}": v for k, v in grad_norms.items()}
+                    | {"batch_step": global_step}
+                )
             global_step += 1
+            ld.update(grad_norms)
 
         for k, v in ld.items():
             losses[k] += v
         n += 1
 
         if (i + 1) % 50 == 0:
-            logger.info(f"  batch {i+1}/{len(loader)}  loss={losses['loss_total']/n:.4f}")
-        break
+            logger.info(
+                f"  batch {i+1}/{len(loader)}  loss={losses['loss_total']/n:.4f}  "
+                f"reg={losses.get('loss_regression', 0.0)/n:.4f}  "
+                f"rank={losses.get('loss_ranking', 0.0)/n:.4f}  "
+                f"div={losses.get('loss_diversity', 0.0)/n:.4f}  "
+                f"grad_norm[lang]={losses.get('grad_norm/lang', 0.0)/n:.4f}  "
+                f"grad_norm[vision]={losses.get('grad_norm/vision', 0.0)/n:.4f}  "
+                f"grad_norm[head]={losses.get('grad_norm/head', 0.0)/n:.4f}"
+            )
+        # break
 
     return {k: v / max(n, 1) for k, v in losses.items()}, global_step
 
@@ -333,17 +334,17 @@ def validate(model, loader, criterion, device,
             del batch
             continue
 
-        cids     = [None] * len(masks_list)
-        preds, _ = model(pixel_values, masks_list, cids, input_ids, attn_mask)
-        _, ld    = criterion(preds, gts_list)
+        preds, geo_preds, _ = model(pixel_values, masks_list, input_ids, attn_mask,
+                                     return_geo=True)
+        _, ld    = criterion(preds, gts_list, geo_preds=geo_preds)
 
         for k, v in ld.items():
             losses[k] += v
         n += 1
 
-        # accumulate metrics
+        # accumulate metrics — apply sigmoid to convert raw logits to [0, 1]
         for p, g in zip(preds, gts_list):
-            all_preds.append(p.cpu().numpy())
+            all_preds.append(torch.sigmoid(p).cpu().numpy())
             all_gts.append(g.cpu().numpy())
 
         # collect visualization samples (small number)
@@ -353,7 +354,7 @@ def validate(model, loader, criterion, device,
                     break
                 try:
                     frame_rgb, masks_arr, node_ids = _extract_sample_masks_and_rgb(batch, i)
-                    pred_np = p.cpu().numpy()
+                    pred_np = torch.sigmoid(p).cpu().numpy()  # logits -> [0,1] for viz
                     gt_np   = g.cpu().numpy()
                     K = min(len(pred_np), len(gt_np), masks_arr.shape[0])
                     if K == 0:
@@ -364,8 +365,7 @@ def validate(model, loader, criterion, device,
                 except Exception as e:
                     print(f"Viz sample {i} failed: {e}")
             first_batch_vizd = True
-        break
-
+        # break
     avg_losses = {k: v / max(n, 1) for k, v in losses.items()}
     metrics    = compute_metrics(all_preds, all_gts)
     metrics.update(avg_losses)
@@ -386,6 +386,7 @@ def validate(model, loader, criterion, device,
 
 def train_h5(
     h5_path: str,
+    lmdb_path: str | None = None,
     val_h5_path: str | None = None,
     output_dir: str = "./checkpoints",
     run_dir: str | None = None,
@@ -401,7 +402,7 @@ def train_h5(
     weight_decay: float = 0.01,
     warmup_epochs: int = 3, grad_accum: int = 1,
     lambda_rank: float = 0.5, lambda_si: float = 0.3,
-    num_workers: int = 0, seed: int = 42, patience: int = 10,
+    num_workers: int = 4, seed: int = 42, patience: int = 10,
     device=None,
     resume: str | None = None,
 ):
@@ -416,15 +417,20 @@ def train_h5(
     os.makedirs(analysis_dir, exist_ok=True)
 
     logger.info("Building model...")
-    model   = build_langgeonet(d_model, n_heads, n_layers, num_classes, clip_model).to(device)
+    model   = LangGeoNetV2(d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+                           clip_model_name=clip_model).to(device)
     total_p = sum(p.numel() for p in model.parameters())
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Params: {total_p:,} total  {train_p:,} trainable")
 
     logger.info("Loading data...")
-    train_loader, val_loader = create_h5_episode_pathlengths_dataloader(
-        h5_path=h5_path, batch_size=batch_size,
-        shuffle=False, num_workers=num_workers,
+    # train_loader, val_loader = create_lmdb_episode_pathlengths_dataloader(
+    #     h5_path=h5_path, batch_size=batch_size,
+    #     num_workers=num_workers,
+    # )
+    train_loader, val_loader = create_lmdb_episode_pathlengths_dataloader(
+        lmdb_path=lmdb_path, batch_size=batch_size,
+        num_workers=num_workers,
     )
     # val_loader = create_h5_episode_pathlengths_dataloader(
     #     h5_path=val_h5_path or h5_path,
@@ -487,7 +493,7 @@ def train_h5(
             model, train_loader, criterion, optimizer, device,
             grad_accum, wandb_run, global_step,
         )
-        val_m = validate(model, train_loader, criterion, device,
+        val_m = validate(model, val_loader, criterion, device,
                  wandb_run=wandb_run, exp_dir=analysis_dir, epoch=epoch + 1, max_viz=8)
         scheduler.step()
 
@@ -567,7 +573,8 @@ def train_h5(
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--h5_path",       required=True)
+    p.add_argument("--h5_path",       default=None)
+    p.add_argument("--lmdb_path", default=None)
     p.add_argument("--val_h5_path",   default=None)
     p.add_argument("--run_dir",       default=None)
     p.add_argument("--output_dir",    default="./checkpoints")
@@ -575,8 +582,8 @@ if __name__ == "__main__":
     p.add_argument("--wandb_run_name",default=None)
     p.add_argument("--no_wandb",      action="store_true")
     p.add_argument("--epochs",        type=int,   default=100)
-    p.add_argument("--batch_size",    type=int,   default=8)
-    p.add_argument("--lr_head",       type=float, default=1e-3)
+    p.add_argument("--batch_size",    type=int,   default=24)
+    p.add_argument("--lr_head",       type=float, default=3e-4)
     p.add_argument("--lr_backbone",   type=float, default=1e-5)
     p.add_argument("--d_model",       type=int,   default=256)
     p.add_argument("--n_layers",      type=int,   default=1)
@@ -591,6 +598,7 @@ if __name__ == "__main__":
 
     train_h5(
         h5_path=a.h5_path,
+        lmdb_path= a.lmdb_path,
         val_h5_path=a.val_h5_path,
         run_dir=a.run_dir,
         output_dir=a.output_dir,

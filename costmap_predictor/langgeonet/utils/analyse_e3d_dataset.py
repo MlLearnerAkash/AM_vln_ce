@@ -10,7 +10,7 @@ Usage:
         [--max-episodes N]   # analyse only the first N episodes (default: all)
         [--plot]             # save histogram plots alongside the script
 """
-
+from __future__ import annotations
 import argparse
 import io
 import os

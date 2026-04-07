@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from transformers import CLIPProcessor  # ← removed BertTokenizer
 
-from .model import LangGeoNet
+from .model import LangGeoNetV2
 
 
 class LangGeoNetPredictor:
@@ -44,11 +44,11 @@ class LangGeoNetPredictor:
         cfg = ckpt["config"]
 
         # Build model — no num_classes needed
-        self.model = LangGeoNet(
+        self.model = LangGeoNetV2(
             d_model=cfg["d_model"],
             n_heads=cfg["n_heads"],
             n_layers=cfg["n_layers"],
-            clip_model_name=cfg["clip_model"],  # ← removed num_classes
+            clip_model_name=cfg["clip_model"],
         )
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model = self.model.to(self.device)
@@ -105,7 +105,6 @@ class LangGeoNetPredictor:
         predictions, attn_weights_all = self.model(
             images=pixel_values,
             masks_list=[masks_t],
-            class_ids_list=None,   # ← not used anymore
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
@@ -310,7 +309,6 @@ class LangGeoNetPredictor:
         predictions, _ = self.model(
             images=pixel_values,
             masks_list=masks_t,
-            class_ids_list=None,   # ← not used anymore
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
