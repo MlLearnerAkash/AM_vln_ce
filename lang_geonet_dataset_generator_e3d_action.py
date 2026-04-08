@@ -291,18 +291,23 @@ def _get_insta_DA_edges(dMat, max_temporal_gap, nodeID_to_imgRegionIdx):
 
 def save_episode_to_hdf5_with_actions(hdf5_path: str, ep_data: dict) -> None:
     """
-    Append one episode into an HDF5 file, including per-frame
-    next_action_instruction strings.
+    Append one episode into an HDF5 file, including per-frame mask arrays
+    and next-action labels.
 
     HDF5 layout
     -----------
     /<episode_id>/
-        instruction          (scalar string dataset — navigation instruction)
-        graph                (raw bytes dataset — pickled networkx graph)
+        instruction          (scalar string — navigation instruction)
+        graph                (raw bytes  — pickled networkx graph)
         frames/
             <000>/
-                rgb                       (H x W x 3  uint8)
+                rgb                       (H x W x 3  uint8,  gzip-4)
+                masks                     (K x H x W  uint8,  gzip-4)
+                class_ids                 (K          int64)
+                instance_ids              (K          int64)
+                e3d_distances             (K          float32)  normalised [0,1]
                 frame_idx                 (scalar int)
+                next_action               (scalar int  0-3)
                 next_action_instruction   (scalar string)
             <001>/
                 ...
@@ -332,14 +337,45 @@ def save_episode_to_hdf5_with_actions(hdf5_path: str, ep_data: dict) -> None:
             frame_key = f"{fd['frame_idx']:03d}"
             frame_grp = frames_grp.create_group(frame_key)
 
+            # ── RGB ──────────────────────────────────────────────────────────
             rgb = np.asarray(fd["rgb"], dtype=np.uint8)
+            H, W = rgb.shape[:2]
             frame_grp.create_dataset(
-                "rgb",
-                data=rgb,
-                compression="gzip",
-                compression_opts=4,
+                "rgb", data=rgb, compression="gzip", compression_opts=4
             )
-            frame_grp.create_dataset("frame_idx", data=fd["frame_idx"])
+
+            # ── K-channel mask arrays (mirrors _save_frame_data_e3d) ─────────
+            mask_dicts    = fd.get("mask_dicts", [])
+            K             = len(mask_dicts)
+            if K > 0:
+                masks = np.stack(
+                    [m["segmentation"].astype(np.uint8) for m in mask_dicts], axis=0
+                )  # [K, H, W]
+                class_ids    = np.array(
+                    [m["category_id"] if m["category_id"] is not None else -1
+                     for m in mask_dicts], dtype=np.int64
+                )
+                instance_ids = np.array(
+                    [m["instance_id"] for m in mask_dicts], dtype=np.int64
+                )
+                e3d_distances = np.asarray(
+                    fd.get("e3d_norm", np.zeros(K, dtype=np.float32)), dtype=np.float32
+                )
+            else:
+                masks         = np.zeros((0, H, W), dtype=np.uint8)
+                class_ids     = np.zeros(0, dtype=np.int64)
+                instance_ids  = np.zeros(0, dtype=np.int64)
+                e3d_distances = np.zeros(0, dtype=np.float32)
+
+            frame_grp.create_dataset(
+                "masks", data=masks, compression="gzip", compression_opts=4
+            )
+            frame_grp.create_dataset("class_ids",     data=class_ids)
+            frame_grp.create_dataset("instance_ids",  data=instance_ids)
+            frame_grp.create_dataset("e3d_distances", data=e3d_distances)
+
+            # ── scalars / labels ─────────────────────────────────────────────
+            frame_grp.create_dataset("frame_idx",   data=fd["frame_idx"])
             frame_grp.create_dataset("next_action", data=fd.get("next_action", 0))
             frame_grp.create_dataset(
                 "next_action_instruction",
@@ -381,6 +417,10 @@ def load_episode_from_hdf5_with_actions(hdf5_path: str, episode_id: str) -> dict
             frame_data.append({
                 "frame_idx":               int(fg["frame_idx"][()]),
                 "rgb":                     fg["rgb"][()],
+                "masks":                   fg["masks"][()] if "masks" in fg else None,
+                "class_ids":               fg["class_ids"][()] if "class_ids" in fg else None,
+                "instance_ids":            fg["instance_ids"][()] if "instance_ids" in fg else None,
+                "e3d_distances":           fg["e3d_distances"][()] if "e3d_distances" in fg else None,
                 "next_action":             int(fg["next_action"][()]) if "next_action" in fg else 0,
                 "next_action_instruction": nai,
             })
@@ -601,6 +641,7 @@ def episode_generator(env, data_root, num_episodes: int = 10):
                         'rgb':                     rgb,
                         'mask_dicts':              mask_dicts,
                         'instance_id_dict':        instance_id_dict,
+                        'e3d_norm':                e3d_norm,          # [K] float32, already computed
                         'next_action':             peek_action_int,
                         'next_action_instruction': next_action_instruction,
                     })

@@ -2,13 +2,15 @@
 """
 analyse_e3d_dataset.py
 ======================
-Comprehensive analysis of the e3d_metric HDF5 dataset.
+Comprehensive analysis of the e3d HDF5 dataset.
+Handles both the original e3d_metric format and the action-instruction format
+(frames containing ``next_action_instruction`` fields).
 
 Usage:
-    python scripts/analyse_e3d_dataset.py \
-        --h5 /media/opervu-user/Data2/ws/data_langgeonet_e3d/e3d_metric_train_ep500.h5 \
+    python utils/analyse_e3d_dataset.py \
+        --h5 /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_test.h5 \
         [--max-episodes N]   # analyse only the first N episodes (default: all)
-        [--plot]             # save histogram plots alongside the script
+        [--plot]             # save plots alongside the script
 """
 from __future__ import annotations
 import argparse
@@ -18,8 +20,57 @@ import pickle
 import time
 from collections import Counter, defaultdict
 
+import re
+
 import h5py
 import numpy as np
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MP3D semantic category map
+# ─────────────────────────────────────────────────────────────────────────────
+MP3D_CATS = {
+    0: "void",        1: "wall",          2: "floor",         3: "chair",
+    4: "door",        5: "table",         6: "picture",       7: "cabinet",
+    8: "cushion",     9: "window",       10: "sofa",         11: "bed",
+   12: "curtain",    13: "chest_of_drawers", 14: "plant",   15: "sink",
+   16: "stairs",     17: "ceiling",     18: "toilet",       19: "stool",
+   20: "towel",      21: "mirror",      22: "tv_monitor",   23: "shower",
+   24: "column",     25: "bathtub",     26: "counter",      27: "fireplace",
+   28: "lighting",   29: "beam",        30: "railing",      31: "shelving",
+   32: "blinds",     33: "gym_equipment", 34: "seating",   35: "board_panel",
+   36: "furniture",  37: "appliances",  38: "clothes",      39: "objects",
+}
+
+# Pre-build regex for object names (longest first to avoid partial matches)
+_OBJ_NAMES = sorted(MP3D_CATS.values(), key=len, reverse=True)
+_OBJ_PATTERN = re.compile(
+    r'\b(' + '|'.join(re.escape(o) for o in _OBJ_NAMES) + r')\b', re.IGNORECASE
+)
+
+# Directional categories
+_DIR_LEFT    = re.compile(r'\bleft\b',                         re.IGNORECASE)
+_DIR_RIGHT   = re.compile(r'\bright\b',                        re.IGNORECASE)
+_DIR_FORWARD = re.compile(r'\b(forward|straight|ahead)\b',     re.IGNORECASE)
+_DIR_STOP    = re.compile(r'\b(halt|stop|destination|arrived)\b', re.IGNORECASE)
+
+
+def _parse_instruction(text: str):
+    """Return (direction_label, object_name | None) for one instruction string."""
+    if _DIR_LEFT.search(text):
+        direction = "left"
+    elif _DIR_RIGHT.search(text):
+        direction = "right"
+    elif _DIR_FORWARD.search(text):
+        direction = "forward"
+    elif _DIR_STOP.search(text):
+        direction = "stop"
+    else:
+        direction = "other"
+
+    obj_match = _OBJ_PATTERN.search(text)
+    obj = obj_match.group(1).lower() if obj_match else None
+    return direction, obj
+
 
 # ── optional matplotlib (non-interactive backend) ────────────────────────────
 try:
@@ -136,6 +187,11 @@ def analyse(h5_path: str, max_episodes: int | None = None, save_plots: bool = Fa
     # instruction text stats
     instruction_lengths  = []          # word count
 
+    # next_action_instruction stats
+    direction_counts     = Counter()   # left / right / forward / stop / other
+    object_counts        = Counter()   # MP3D category names
+    has_action_instrs    = False
+
     print("\nProcessing episodes …")
     for ep_i, ep_key in enumerate(ep_keys):
         if ep_i % 50 == 0 and ep_i > 0:
@@ -159,6 +215,18 @@ def analyse(h5_path: str, max_episodes: int | None = None, save_plots: bool = Fa
             instr_raw = ep_grp["instruction"][()]
             instr = instr_raw.decode("utf-8") if isinstance(instr_raw, bytes) else str(instr_raw)
             instruction_lengths.append(len(instr.split()))
+
+            # ── next_action_instruction (per frame) ─────────────────────────
+            for fk in sorted(frame_grps.keys()):
+                fg = frame_grps[fk]
+                if "next_action_instruction" in fg:
+                    has_action_instrs = True
+                    nai_raw = fg["next_action_instruction"][()]
+                    nai = nai_raw.decode("utf-8") if isinstance(nai_raw, bytes) else str(nai_raw)
+                    direction, obj = _parse_instruction(nai)
+                    direction_counts[direction] += 1
+                    if obj is not None:
+                        object_counts[obj] += 1
 
             # ── graph ───────────────────────────────────────────────────────
             graph_bytes_raw = ep_grp["graph"][()].tobytes()
@@ -349,9 +417,31 @@ def analyse(h5_path: str, max_episodes: int | None = None, save_plots: bool = Fa
     P("Max words",                int(il.max()))
     print()
 
-    # ── 10. Root causes summary ──────────────────────────────────────────────
+    # ── 10. Next-action instruction analysis ─────────────────────────────────
+    if has_action_instrs:
+        print(sep)
+        print("  10. NEXT-ACTION INSTRUCTION ANALYSIS")
+        print(sep)
+        total_nai = sum(direction_counts.values())
+        P("Total next_action_instruction entries", total_nai)
+        print()
+        print("  Directional distribution:")
+        for d in ["forward", "left", "right", "stop", "other"]:
+            cnt = direction_counts.get(d, 0)
+            bar = "█" * int(40 * cnt / max(1, total_nai))
+            P(f"    {d:<10}", f"{cnt:6d}  ({100*cnt/max(1,total_nai):5.1f}%)  {bar}")
+        print()
+        print("  Object reference distribution (top 20 by frequency):")
+        top_objs = object_counts.most_common(20)
+        max_obj_cnt = top_objs[0][1] if top_objs else 1
+        for obj, cnt in top_objs:
+            bar = "█" * int(40 * cnt / max(1, max_obj_cnt))
+            P(f"    {obj:<22}", f"{cnt:6d}  ({100*cnt/max(1,total_nai):5.1f}%)  {bar}")
+        print()
+
+    # ── 11. Root causes summary ──────────────────────────────────────────────
     print(sep2)
-    print("  10. ROOT CAUSE SUMMARY — WHY NORMALISED COSTS COLLAPSE")
+    print("  11. ROOT CAUSE SUMMARY — WHY NORMALISED COSTS COLLAPSE")
     print(sep2)
     all_edges = sum(graph_edge_counts)
     all_da    = sum(da_edge_counts)
@@ -385,6 +475,8 @@ def analyse(h5_path: str, max_episodes: int | None = None, save_plots: bool = Fa
     if save_plots and HAS_MPL:
         out_dir = os.path.dirname(os.path.abspath(__file__))
         _plot(mpf, nc, cs, e3d_arr, fps, out_dir)
+        if has_action_instrs:
+            _plot_action_instrs(direction_counts, object_counts, out_dir)
     elif save_plots and not HAS_MPL:
         print("  [INFO] matplotlib not available – skipping plots.")
 
@@ -448,11 +540,81 @@ def _plot(mpf, nc, cs, e3d_arr, fps, out_dir):
     plt.close(fig)
 
 
+def _plot_action_instrs(direction_counts: Counter, object_counts: Counter, out_dir: str):
+    """Pie chart for directional cues + bar plot for object references."""
+    dir_order  = ["forward", "left", "right", "stop", "other"]
+    dir_colors = ["#4C9BE8", "#F4A261", "#E76F51", "#2A9D8F", "#B5B5B5"]
+
+    dir_labels = []
+    dir_sizes  = []
+    dir_cols   = []
+    for d, c in zip(dir_order, dir_colors):
+        cnt = direction_counts.get(d, 0)
+        if cnt > 0:
+            dir_labels.append(d)
+            dir_sizes.append(cnt)
+            dir_cols.append(c)
+
+    # Object bar (sort by frequency, all objects)
+    obj_items = object_counts.most_common()
+    obj_names = [o for o, _ in obj_items]
+    obj_vals  = [v for _, v in obj_items]
+
+    fig, (ax_pie, ax_bar) = plt.subplots(
+        1, 2, figsize=(16, max(6, len(obj_names) * 0.35 + 2))
+    )
+    fig.suptitle("Next-Action Instruction Analysis", fontsize=14, fontweight="bold")
+
+    # — Pie chart ────────────────────────────────────────────────────────────
+    wedges, texts, autotexts = ax_pie.pie(
+        dir_sizes,
+        labels=dir_labels,
+        colors=dir_cols,
+        autopct="%1.1f%%",
+        startangle=90,
+        textprops={"fontsize": 11},
+        wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+    )
+    for at in autotexts:
+        at.set_fontsize(10)
+    ax_pie.set_title("Directional Cue Distribution", fontsize=12)
+    total = sum(dir_sizes)
+    ax_pie.legend(
+        [f"{l}  ({c:,} / {100*c/total:.1f}%)" for l, c in zip(dir_labels, dir_sizes)],
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.12),
+        fontsize=9,
+        frameon=False,
+    )
+
+    # — Bar chart ─────────────────────────────────────────────────────────────
+    y_pos = np.arange(len(obj_names))
+    bars = ax_bar.barh(y_pos, obj_vals, color="steelblue", edgecolor="white", linewidth=0.4)
+    ax_bar.set_yticks(y_pos)
+    ax_bar.set_yticklabels(obj_names, fontsize=9)
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("Count", fontsize=10)
+    ax_bar.set_title("Object Reference Frequency (MP3D categories)", fontsize=12)
+    ax_bar.grid(axis="x", alpha=0.3)
+    # annotate counts
+    for bar, val in zip(bars, obj_vals):
+        ax_bar.text(
+            bar.get_width() + max(obj_vals) * 0.005, bar.get_y() + bar.get_height() / 2,
+            str(val), va="center", ha="left", fontsize=8,
+        )
+
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, "action_instruction_analysis.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"  Action instruction plots saved → {out_path}")
+    plt.close(fig)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--h5",  default="/media/opervu-user/Data2/ws/data_langgeonet_e3d/e3d_metric_train_ep500.h5",
+    parser.add_argument("--h5",  default="/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_test.h5",
                         help="Path to the HDF5 dataset file")
     parser.add_argument("--max-episodes", type=int, default=None,
                         help="Analyse only the first N episodes (default: all)")
