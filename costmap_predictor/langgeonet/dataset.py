@@ -649,15 +649,17 @@ def convert_h5_to_lmdb(
     -------------------------    -----------------------------------------------
     b"__keys__"                  list[bytes] — sorted list of all frame keys
     b"{ep_id}/{frame_idx:03d}"   dict with fields:
-                                   ep_id          : str
-                                   frame_idx      : int
-                                   rgb_jpeg       : bytes  (JPEG-encoded RGB)
-                                   rle_list       : list[dict | None]
-                                   path_rows      : bytes  (float32 ndarray,
-                                                           shape [K, G])
-                                   path_rows_shape: tuple  (K, G)
-                                   input_ids      : bytes  (int32 ndarray [77])
-                                   attention_mask : bytes  (int32 ndarray [77])
+                                   ep_id            : str
+                                   frame_idx        : int
+                                   rgb_jpeg         : bytes  (JPEG-encoded RGB)
+                                   rle_list         : list[dict | None]
+                                   path_rows        : bytes  (float32 ndarray,
+                                                             shape [K, G])
+                                   path_rows_shape  : tuple  (K, G)
+                                   input_ids        : bytes  (int32 ndarray [77])
+                                   attention_mask   : bytes  (int32 ndarray [77])
+                                   nai_input_ids    : bytes  (int32 ndarray [77])
+                                   nai_attention_mask: bytes (int32 ndarray [77])
 
     Parameters
     ----------
@@ -761,15 +763,33 @@ def convert_h5_to_lmdb(
                     # -- RLE list --------------------------------------------
                     rle_list = [G.nodes[n].get('segmentation') for n in nodes]
 
+                    # -- next_action_instruction tokens (per frame) ----------
+                    frame_grp = ep_grp["frames"][h5_frame_key]
+                    if "next_action_instruction" in frame_grp:
+                        nai_raw = frame_grp["next_action_instruction"][()]
+                        nai_text = nai_raw.decode("utf-8") if isinstance(nai_raw, bytes) \
+                                   else str(nai_raw)
+                    else:
+                        nai_text = ""
+                    nai_tok = clip_processor(
+                        text=nai_text,
+                        padding='max_length', truncation=True,
+                        max_length=77, return_tensors='pt',
+                    )
+                    nai_input_ids_bytes  = nai_tok['input_ids'].squeeze(0).numpy().astype(np.int32).tobytes()
+                    nai_attn_mask_bytes  = nai_tok['attention_mask'].squeeze(0).numpy().astype(np.int32).tobytes()
+
                     record = {
-                        'ep_id':           ep_id,
-                        'frame_idx':       int(frame_idx),
-                        'rgb_jpeg':        rgb_jpeg,
-                        'rle_list':        rle_list,
-                        'path_rows':       path_rows.tobytes(),
-                        'path_rows_shape': path_rows.shape,
-                        'input_ids':       input_ids_bytes,
-                        'attention_mask':  attn_mask_bytes,
+                        'ep_id':              ep_id,
+                        'frame_idx':          int(frame_idx),
+                        'rgb_jpeg':           rgb_jpeg,
+                        'rle_list':           rle_list,
+                        'path_rows':          path_rows.tobytes(),
+                        'path_rows_shape':    path_rows.shape,
+                        'input_ids':          input_ids_bytes,
+                        'attention_mask':     attn_mask_bytes,
+                        'nai_input_ids':      nai_input_ids_bytes,
+                        'nai_attention_mask': nai_attn_mask_bytes,
                     }
                     txn.put(frame_key, _pickle.dumps(record, protocol=4))
                     all_keys.append(frame_key)
@@ -935,17 +955,25 @@ class LMDBEpisodePathLengthsDataset(Dataset):
         attn_mask  = torch.from_numpy(
             np.frombuffer(rec['attention_mask'], dtype=np.int32).copy()).long()
 
+        # -- next_action_instruction tokens ----------------------------------
+        nai_input_ids = torch.from_numpy(
+            np.frombuffer(rec['nai_input_ids'],      dtype=np.int32).copy()).long()
+        nai_attn_mask = torch.from_numpy(
+            np.frombuffer(rec['nai_attention_mask'], dtype=np.int32).copy()).long()
+
         frame_rgb = np.array(pil_img)  # [H, W, 3] uint8 — for visualisation
 
         return {
-            'episode_id':     ep_id,
-            'frame_idx':      frame_idx,
-            'frame_rgb':      frame_rgb,                                       # [H, W, 3] uint8
-            'pixel_values':   pixel_values,                                    # [3, 224, 224]
-            'masks':          torch.from_numpy(masks_arr).bool(),              # [K, H, W]
-            'gt_costs':       torch.from_numpy(gt_costs.astype(np.float32)),  # [K]
-            'input_ids':      input_ids,                                       # [77]
-            'attention_mask': attn_mask,                                       # [77]
+            'episode_id':          ep_id,
+            'frame_idx':           frame_idx,
+            'frame_rgb':           frame_rgb,                                       # [H, W, 3] uint8
+            'pixel_values':        pixel_values,                                    # [3, 224, 224]
+            'masks':               torch.from_numpy(masks_arr).bool(),              # [K, H, W]
+            'gt_costs':            torch.from_numpy(gt_costs.astype(np.float32)),  # [K]
+            'input_ids':           input_ids,                                       # [77]
+            'attention_mask':      attn_mask,                                       # [77]
+            'nai_input_ids':       nai_input_ids,                                   # [77]
+            'nai_attention_mask':  nai_attn_mask,                                   # [77]
         }
 
 
@@ -986,14 +1014,16 @@ def create_lmdb_episode_pathlengths_dataloader(
 
     def _collate(batch: list[dict]) -> dict:
         return {
-            "pixel_values":   torch.stack([b["pixel_values"]    for b in batch]),
-            "input_ids":      torch.stack([b["input_ids"]       for b in batch]),
-            "attention_mask": torch.stack([b["attention_mask"]  for b in batch]),
-            "masks_list":     [b["masks"]    for b in batch],
-            "gt_costs_list":  [b["gt_costs"] for b in batch],
-            "frame_rgbs":     [b["frame_rgb"] for b in batch],
-            "episode_ids":    [b["episode_id"] for b in batch],
-            "frame_idxs":     [b["frame_idx"]  for b in batch],
+            "pixel_values":       torch.stack([b["pixel_values"]       for b in batch]),
+            "input_ids":          torch.stack([b["input_ids"]          for b in batch]),
+            "attention_mask":     torch.stack([b["attention_mask"]     for b in batch]),
+            "nai_input_ids":      torch.stack([b["nai_input_ids"]      for b in batch]),
+            "nai_attention_mask": torch.stack([b["nai_attention_mask"] for b in batch]),
+            "masks_list":         [b["masks"]    for b in batch],
+            "gt_costs_list":      [b["gt_costs"] for b in batch],
+            "frame_rgbs":         [b["frame_rgb"] for b in batch],
+            "episode_ids":        [b["episode_id"] for b in batch],
+            "frame_idxs":         [b["frame_idx"]  for b in batch],
         }
 
     loader_kwargs = dict(

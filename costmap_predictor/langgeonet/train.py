@@ -72,8 +72,8 @@ def _prepare_batch(batch: dict, device: torch.device):
     Masks and GT costs are computed in __getitem__ (worker processes).
     """
     pixel_values = batch["pixel_values"].to(device)
-    input_ids    = batch["input_ids"].to(device)
-    attn_mask    = batch["attention_mask"].to(device)
+    input_ids    = batch["nai_input_ids"].to(device) #batch["input_ids"].to(device)
+    attn_mask    = batch["nai_attention_mask"].to(device)
     masks_list   = [m.to(device) for m in batch["masks_list"]]
     gts_list     = [g.to(device) for g in batch["gt_costs_list"]]
     return pixel_values, input_ids, attn_mask, masks_list, gts_list
