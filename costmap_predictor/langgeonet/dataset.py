@@ -790,6 +790,7 @@ def convert_h5_to_lmdb(
                         'attention_mask':     attn_mask_bytes,
                         'nai_input_ids':      nai_input_ids_bytes,
                         'nai_attention_mask': nai_attn_mask_bytes,
+                        'nai_text':           nai_text,
                     }
                     txn.put(frame_key, _pickle.dumps(record, protocol=4))
                     all_keys.append(frame_key)
@@ -822,7 +823,8 @@ class LMDBEpisodePathLengthsDataset(Dataset):
     Returns the same dict schema as H5EpisodePathLengthsDataset.
     """
 
-    def __init__(self, lmdb_path: str, episode_ids: list = None):
+    def __init__(self, lmdb_path: str, episode_ids: list = None,
+                 nai_text_contains: str = None):
         super().__init__()
         import pickle as _pickle
         import lmdb
@@ -842,7 +844,6 @@ class LMDBEpisodePathLengthsDataset(Dataset):
                     f"LMDB at {lmdb_path} has no '__keys__' entry. "
                     "Run convert_h5_to_lmdb() first.")
             all_keys: list = _pickle.loads(raw)   # list[bytes]
-        env.close()
 
         # Filter by requested episode_ids if provided.
         if episode_ids is not None:
@@ -850,13 +851,31 @@ class LMDBEpisodePathLengthsDataset(Dataset):
             all_keys = [k for k in all_keys
                         if k.decode('utf-8').split('/')[0] in ep_set]
 
+        # Filter by next_action_instruction substring if requested.
+        if nai_text_contains is not None:
+            needle = nai_text_contains.lower()
+            filtered = []
+            for k in all_keys:
+                rec_raw = None
+                with env.begin(write=False) as txn:
+                    rec_raw = txn.get(k)
+                if rec_raw is None:
+                    continue
+                rec = _pickle.loads(rec_raw)
+                nai = rec.get('nai_text', '')
+                if needle in nai.lower():
+                    filtered.append(k)
+            all_keys = filtered
+        env.close()
+
         self._keys = all_keys   # list[bytes]
         if episode_ids is None:
             ep_desc = "all episodes"
         else:
             n_ep = len({k.decode('utf-8').split('/')[0] for k in self._keys})
             ep_desc = f"{n_ep} episodes"
-        print(f"[LMDBEpisodePathLengthsDataset] {len(self._keys)} frames ({ep_desc})")
+        filter_desc = f", nai contains '{nai_text_contains}'" if nai_text_contains else ""
+        print(f"[LMDBEpisodePathLengthsDataset] {len(self._keys)} frames ({ep_desc}{filter_desc})")
 
     def __len__(self) -> int:
         return len(self._keys)

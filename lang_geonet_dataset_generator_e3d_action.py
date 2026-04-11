@@ -48,7 +48,7 @@ if _ORN_LIBS not in sys.path:
 
 from libs.common.utils import get_instance_id_to_all_dict, mask_to_rle_numpy
 
-EXCLUDE_CATS = ["ceiling", "beam", "objects", "lighting", "column", "misc", "railing", "floor"]
+EXCLUDE_CATS = ["ceiling", "beam", "objects", "lighting", "column", "misc", "railing", "floor", "void", "wall"]
 
 # ---------------------------------------------------------------------------
 # Action → natural-language instruction (contextual with paraphrase pool)
@@ -155,7 +155,7 @@ def _pick_anchor_candidates(
     """
     K = len(mask_dicts)
     if K == 0:
-        return []
+        return [], None
     action_int = 0 if action is None else int(action)
 
     # ── 1. E3D pool: top-3 least-cost ────────────────────────────────────────
@@ -187,13 +187,7 @@ def _pick_anchor_candidates(
             best_area   = area
             directional = md['category_name']
 
-    # ── deduplicate while preserving insertion order ──────────────────────────
-    seen, pool = set(), []
-    for name in e3d_pool + ([directional] if directional else []):
-        if name not in seen:
-            seen.add(name)
-            pool.append(name)
-    return pool
+    return e3d_pool, directional
 
 
 def _action_to_instruction_contextual(
@@ -212,12 +206,26 @@ def _action_to_instruction_contextual(
     """
     action_int = 0 if action is None else int(action)
     templates  = ACTION_TEMPLATES.get(action_int, ACTION_TEMPLATES[0])
-    candidates = _pick_anchor_candidates(mask_dicts, instances, action, width, e3d_norm)
-    if candidates:
-        anchor = random.choice(candidates)
-        return random.choice(templates).format(obj=anchor)
-    plain = [t for t in templates if '{obj}' not in t]
-    return random.choice(plain) if plain else templates[0]
+    plain      = [t for t in templates if '{obj}' not in t]
+    obj_tmpls  = [t for t in templates if '{obj}' in t]
+
+    e3d_pool, directional = _pick_anchor_candidates(mask_dicts, instances, action, width, e3d_norm)
+
+    # Weighted anchor selection: E3D pool 80%, directional (largest-area) ≤20%
+    if e3d_pool and directional:
+        anchor = random.choice(e3d_pool) if random.random() < 0.8 else directional
+    elif e3d_pool:
+        anchor = random.choice(e3d_pool)
+    elif directional:
+        anchor = directional
+    else:
+        anchor = None
+
+    use_object = anchor is not None and obj_tmpls and (random.random() < 0.8)
+
+    if use_object:
+        return random.choice(obj_tmpls).format(obj=anchor)
+    return random.choice(plain) if plain else (random.choice(obj_tmpls).format(obj=anchor) if anchor else templates[0])
 
 
 # ---------------------------------------------------------------------------
